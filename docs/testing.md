@@ -109,3 +109,6 @@ Chrome手動驗證實際服務資料：
 v0.5未新增硬體／聲學／延遲實測；900筆/TTL透過可控制時間的unit tests驗證，不宣稱已跑15分鐘或4小時Wi-Fi實機soak。事件ring每台4096固定上限，極高事件量會較早淘汰最舊事件，詳細見telemetry契約。
 
 可重跑全部：`powershell -ExecutionPolicy Bypass -File scripts/verify.ps1`，需要cargo、Node.js24、Python、GCC與可用Windowsoutput。整合程序在finally結束；本次瀏覽器測試程序也會清理，不留下背景服務。
+# v0.5.2 timing verification
+
+Release timing benchmarks, measured results, scenario limitations and manual listening/focus instructions are documented in [BUG-001](bug-001-windows-background-timing.md). Run `python tests/bug-001-report.py` after the timing and background benchmarks to regenerate `artifacts/bug-001-results.json`. Generated diagnostic files and executables are ignored by Git; committed documentation records the measured summary.

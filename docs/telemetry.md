@@ -97,3 +97,6 @@ Chart.js 4.5.1＋annotation plugin 3.1.0，由Angular component lifecycle建立�
 前端重同步取15分鐘完整history，供所有範圍和60秒aggregate共同使用；每台選取裝置的前端快取最多900 samples和4096 events。圖表依range篩選。`null`不補零、`spanGaps=false`，discontinuity形成斷線。沒有任何示範fake data。
 
 [Chart.js line gaps](https://www.chartjs.org/docs/latest/charts/line.html)、[tooltips](https://www.chartjs.org/docs/latest/configuration/tooltip.html)、[annotation lines](https://www.chartjs.org/chartjs-plugin-annotation/latest/guide/types/line.html)為圖表官方參考。
+# v0.5.2 additive timing contract
+
+See [audio-stability.md](audio-stability.md) for new optional TX/RX rates, authenticated Simulator diagnostics and metric definitions. Existing history and WebSocket contracts remain compatible. `lost_packets`/loss charts represent playout deadline deficits, not established UDP network loss. Receive bitrate now counts PCM payload bytes. Backend timestamps remain UTC; the UI defaults to browser local time and offers UTC.

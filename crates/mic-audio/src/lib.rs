@@ -1,3 +1,4 @@
+mod sequence;
 use anyhow::{Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
@@ -65,6 +66,27 @@ pub struct Metrics {
     pub buffer_overruns: u64,
     pub invalid_packets: u64,
     pub output_state: String,
+    pub received_datagrams: u64,
+    pub sequence_gaps: u64,
+    pub sequence_out_of_order: u64,
+    pub rejected_packets: u64,
+    pub authentication_failures: u64,
+    pub session_rejections: u64,
+    pub invalid_packet_headers: u64,
+    pub unpaired_datagrams: u64,
+    pub accepted_packets: u64,
+    pub delivered_packets: u64,
+    pub delivered_samples: u64,
+    pub late_packet_drops: u64,
+    pub jitter_buffer_drops: u64,
+    pub output_frames_requested: u64,
+    pub output_samples_requested: u64,
+    pub input_samples_consumed: u64,
+    pub callback_starvations: u64,
+    pub receiver_clock_resets: u64,
+    pub ring_depth_samples: usize,
+    pub output_sample_rate: u64,
+    pub output_channels: u64,
 }
 pub struct Jitter {
     packets: HashMap<u32, AudioPacket>,
@@ -74,6 +96,7 @@ pub struct Jitter {
     pub metrics: Metrics,
     seen: std::collections::VecDeque<u32>,
     empty_ticks: u8,
+    muted: bool,
 }
 impl Jitter {
     pub fn new(depth: usize) -> Self {
@@ -85,6 +108,7 @@ impl Jitter {
             metrics: Metrics::default(),
             seen: std::collections::VecDeque::new(),
             empty_ticks: 0,
+            muted: false,
         }
     }
     pub fn push(&mut self, p: AudioPacket) {
@@ -103,6 +127,7 @@ impl Jitter {
                 if !self.started && e.wrapping_sub(p.sequence) < 8 {
                     self.expected = Some(p.sequence)
                 } else {
+                    self.metrics.late_packet_drops += 1;
                     return;
                 }
             } else if p.sequence != e.wrapping_add(self.packets.len() as u32) {
@@ -113,6 +138,7 @@ impl Jitter {
         }
         if self.packets.len() >= 8 {
             self.metrics.buffer_overruns += 1;
+            self.metrics.jitter_buffer_drops += self.packets.len() as u64;
             self.packets.clear();
             self.expected = Some(p.sequence);
             self.started = false;
@@ -126,6 +152,7 @@ impl Jitter {
             self.started = false;
             self.metrics.buffer_overruns += 1;
         }
+        self.metrics.accepted_packets += 1;
         self.packets.insert(p.sequence, p);
         self.metrics.jitter_buffer_depth = self.packets.len();
     }
@@ -140,10 +167,14 @@ impl Jitter {
         self.expected = Some(e.wrapping_add(1));
         let output = if let Some(p) = self.packets.remove(&e) {
             self.empty_ticks = 0;
+            self.metrics.delivered_packets += 1;
+            self.metrics.delivered_samples += 160;
             p.samples
         } else {
             self.metrics.lost_packets += 1;
-            self.metrics.buffer_underruns += 1;
+            if !self.muted {
+                self.metrics.buffer_underruns += 1;
+            }
             self.empty_ticks += 1;
             if self.empty_ticks >= 3 && self.packets.is_empty() {
                 // A stalled sender/scheduler must not leave the playout cursor ahead forever.
@@ -183,6 +214,14 @@ pub struct Playback {
     pub state: Arc<Mutex<String>>,
     pub underruns: Arc<AtomicU64>,
     pub overruns: Arc<AtomicU64>,
+    pub input_samples: Arc<AtomicU64>,
+    pub output_frames: Arc<AtomicU64>,
+    pub output_samples: Arc<AtomicU64>,
+    pub callback_starvations: Arc<AtomicU64>,
+    pub sample_rate: Arc<AtomicU64>,
+    pub channels: Arc<AtomicU64>,
+    opened: Arc<AtomicBool>,
+    muted: Arc<AtomicBool>,
 }
 impl Playback {
     pub fn outputs() -> Result<Vec<Output>> {
@@ -209,6 +248,14 @@ impl Playback {
             state: Arc::new(Mutex::new("stopped".into())),
             underruns: Arc::new(AtomicU64::new(0)),
             overruns: Arc::new(AtomicU64::new(0)),
+            input_samples: Arc::new(AtomicU64::new(0)),
+            output_frames: Arc::new(AtomicU64::new(0)),
+            output_samples: Arc::new(AtomicU64::new(0)),
+            callback_starvations: Arc::new(AtomicU64::new(0)),
+            sample_rate: Arc::new(AtomicU64::new(0)),
+            channels: Arc::new(AtomicU64::new(0)),
+            opened: Arc::new(AtomicBool::new(false)),
+            muted: Arc::new(AtomicBool::new(false)),
         };
         let mut worker = p.clone();
         // The worker must not retain a sender to its own command channel.
@@ -222,10 +269,12 @@ impl Playback {
                     let _ = command.reply.send(Ok("stopped".into()));
                     break;
                 }
+                worker.opened.store(false, Ordering::Relaxed);
                 stream.take();
                 worker.clear();
                 match worker.open(&command.id) {
                     Ok((s, name)) => {
+                        worker.opened.store(true, Ordering::Relaxed);
                         stream = Some(s);
                         *worker.state.lock().unwrap() = name.clone();
                         let _ = command.reply.send(Ok(name));
@@ -255,7 +304,13 @@ impl Playback {
         self.active.store(false, Ordering::Relaxed);
         while self.queue.pop().is_some() {}
     }
+    pub fn set_mute(&self, mute: bool) {
+        self.muted.store(mute, Ordering::Relaxed);
+    }
     pub fn feed(&self, frame: [i16; 160]) {
+        if !self.opened.load(Ordering::Relaxed) {
+            return;
+        }
         if self.queue.len() > 960 {
             self.clear();
             self.overruns.fetch_add(1, Ordering::Relaxed);
@@ -278,6 +333,10 @@ impl Playback {
         let config = device.default_output_config()?;
         let stream_config = config.config();
         let name = device.name()?;
+        self.sample_rate
+            .store(stream_config.sample_rate.0 as u64, Ordering::Relaxed);
+        self.channels
+            .store(stream_config.channels as u64, Ordering::Relaxed);
         let s = match config.sample_format() {
             cpal::SampleFormat::F32 => self.build::<f32>(&device, &stream_config)?,
             cpal::SampleFormat::I16 => self.build::<i16>(&device, &stream_config)?,
@@ -296,25 +355,43 @@ impl Playback {
         let underruns = self.underruns.clone();
         let state = self.state.clone();
         let channels = c.channels as usize;
+        let input_samples = self.input_samples.clone();
+        let output_frames = self.output_frames.clone();
+        let output_samples = self.output_samples.clone();
+        let starvations = self.callback_starvations.clone();
+        let muted = self.muted.clone();
+
         let mut sampler = Resampler::new(c.sample_rate.0);
         Ok(d.build_output_stream(
             c,
             move |data: &mut [T], _| {
-                if !active.load(Ordering::Relaxed) {
+                output_frames.fetch_add((data.len() / channels) as u64, Ordering::Relaxed);
+                output_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
+                if !active.load(Ordering::Relaxed) || (!sampler.primed && queue.len() < 320) {
                     data.fill(T::from_sample(0.0));
                     sampler.reset();
                     return;
                 }
                 let mut short = false;
                 for frame in data.chunks_mut(channels) {
-                    let (sample, starved) = sampler.next(|| queue.pop());
+                    let (sample, starved) = sampler.next(|| {
+                        let next = queue.pop();
+                        if next.is_some() {
+                            input_samples.fetch_add(1, Ordering::Relaxed);
+                        }
+                        next
+                    });
                     short |= starved;
                     for out in frame {
                         *out = T::from_sample(sample);
                     }
                 }
                 if short {
-                    underruns.fetch_add(1, Ordering::Relaxed);
+                    starvations.fetch_add(1, Ordering::Relaxed);
+                    if !muted.load(Ordering::Relaxed) {
+                        underruns.fetch_add(1, Ordering::Relaxed);
+                    }
+                    sampler.reset();
                 }
             },
             move |e| {
@@ -334,6 +411,7 @@ pub struct Engine {
     pub playback: Playback,
     started: Instant,
     bytes: u64,
+    sequence: sequence::SequenceTracker,
 }
 impl Engine {
     pub fn new(depth: usize) -> Self {
@@ -342,17 +420,35 @@ impl Engine {
             playback: Playback::new(),
             started: Instant::now(),
             bytes: 0,
+            sequence: sequence::SequenceTracker::default(),
         }
     }
     pub fn receive(&mut self, p: AudioPacket) {
-        self.bytes += 368;
+        self.sequence
+            .observe(p.sequence, self.started.elapsed().as_millis() as u64);
+        self.bytes += 320;
         self.jitter.push(p)
     }
     pub fn tick(&mut self) {
+        self.sequence
+            .finalize(self.started.elapsed().as_millis() as u64);
+        self.jitter.metrics.sequence_gaps = self.sequence.gaps;
+        self.jitter.metrics.sequence_out_of_order = self.sequence.reordered;
+        let was_started = self.jitter.started;
         let f = self.jitter.tick();
-        self.playback.feed(f)
+        if self.jitter.started || was_started {
+            self.playback.feed(f);
+        }
     }
     pub fn reset(&mut self) {
+        self.sequence.reset();
+        self.rebuffer();
+    }
+    pub fn set_mute(&mut self, mute: bool) {
+        self.jitter.muted = mute;
+        self.playback.set_mute(mute);
+    }
+    pub fn rebuffer(&mut self) {
         self.jitter.reset();
         self.playback.clear()
     }
@@ -363,6 +459,14 @@ impl Engine {
         m.buffer_underruns += self.playback.underruns.load(Ordering::Relaxed);
         m.buffer_overruns += self.playback.overruns.load(Ordering::Relaxed);
         m.output_state = self.playback.state.lock().unwrap().clone();
+        m.input_samples_consumed = self.playback.input_samples.load(Ordering::Relaxed);
+        m.output_frames_requested = self.playback.output_frames.load(Ordering::Relaxed);
+        m.output_samples_requested = self.playback.output_samples.load(Ordering::Relaxed);
+        m.callback_starvations = self.playback.callback_starvations.load(Ordering::Relaxed);
+        m.ring_depth_samples = self.playback.queue.len();
+        m.output_sample_rate = self.playback.sample_rate.load(Ordering::Relaxed);
+        m.output_channels = self.playback.channels.load(Ordering::Relaxed);
+
         m
     }
 }
@@ -473,5 +577,60 @@ mod resampling_tests {
             assert!((sample - 0.5).abs() < 0.00001);
         }
         assert!((16000..=16002).contains(&n));
+    }
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use super::*;
+    fn packet(n: u32) -> AudioPacket {
+        AudioPacket {
+            sequence: n,
+            timestamp: n * 160,
+            session: [0; 16],
+            samples: [1; 160],
+        }
+    }
+    #[test]
+    fn duplicates_late_drops_and_delivery_are_distinct() {
+        let mut j = Jitter::new(2);
+        j.push(packet(0));
+        j.push(packet(1));
+        j.push(packet(1));
+        j.tick();
+        j.tick();
+        j.push(packet(2));
+        j.push(packet(3));
+        j.tick();
+        j.tick();
+        j.push(packet(0));
+        assert_eq!(j.metrics.received_packets, 6);
+        assert_eq!(j.metrics.accepted_packets, 4);
+        assert_eq!(j.metrics.delivered_packets, 4);
+        assert_eq!(j.metrics.delivered_samples, 640);
+        assert_eq!(j.metrics.duplicate_packets, 2);
+    }
+    #[test]
+    fn muted_missing_frame_is_a_deficit_not_an_audible_underrun() {
+        let mut j = Jitter::new(2);
+        j.muted = true;
+        j.push(packet(0));
+        j.push(packet(1));
+        j.tick();
+        j.tick();
+        j.tick();
+        assert_eq!(j.metrics.lost_packets, 1);
+        assert_eq!(j.metrics.buffer_underruns, 0);
+    }
+    #[test]
+    fn headless_engine_does_not_accumulate_playback_samples() {
+        let mut engine = Engine::new(2);
+        for n in 0..100 {
+            engine.receive(packet(n));
+            engine.tick();
+        }
+        assert_eq!(engine.metrics().ring_depth_samples, 0);
+        assert_eq!(engine.metrics().buffer_overruns, 0);
+        engine.playback.shutdown();
     }
 }

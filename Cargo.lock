@@ -771,13 +771,16 @@ dependencies = [
 
 [[package]]
 name = "mic-simulator"
-version = "0.4.0"
+version = "0.5.2"
 dependencies = [
  "anyhow",
+ "hex",
  "mic-protocol",
  "rand 0.8.8",
+ "serde",
  "serde_json",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -786,6 +789,7 @@ version = "0.5.0"
 dependencies = [
  "hex",
  "mic-device",
+ "mic-protocol",
  "rand 0.8.8",
  "serde",
  "tokio",

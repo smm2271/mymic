@@ -27,7 +27,7 @@ def request(path,method='GET',body=None,token=True,origin=None):
   with urllib.request.urlopen(r,timeout=6) as response:return response.status,json.load(response)
  except urllib.error.HTTPError as e:return e.code,json.load(e)
 def launch(name,*args,env=None):
- f=open(ROOT/'artifacts'/f'{name}-{len(processes)}.log','w',encoding='utf8');p=subprocess.Popen([str(ROOT/'target/debug'/f'{name}.exe'),*args],cwd=ROOT,stdout=f,stderr=f,env=env);processes.append((p,f));return p
+ f=open(ROOT/'artifacts'/f'{name}-{len(processes)}.log','w',encoding='utf8');p=subprocess.Popen([str(ROOT/'target'/os.environ.get('MIC_TEST_PROFILE','debug')/f'{name}.exe'),*args],cwd=ROOT,stdout=f,stderr=f,env=env);processes.append((p,f));return p
 def device(id='sim-test'):
  return next(d for d in request('/devices')[1] if d['id']==id)
 def state(value,id='sim-test'):return device(id)['state']==value

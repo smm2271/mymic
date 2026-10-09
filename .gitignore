@@ -9,3 +9,5 @@ firmware/**/sdkconfig.local
 *.log
 .env
 artifacts/
+__pycache__/
+*.pyc

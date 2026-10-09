@@ -1,6 +1,6 @@
 [package]
 name = "mic-simulator"
-version = "0.4.0"
+version = "0.5.2"
 edition = "2024"
 [dependencies]
 tokio.workspace = true
@@ -8,3 +8,8 @@ serde_json.workspace = true
 anyhow.workspace = true
 rand.workspace = true
 mic-protocol = { path = "../mic-protocol" }
+
+serde.workspace = true
+hex.workspace = true
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }

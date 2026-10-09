@@ -1,3 +1,4 @@
+pub mod diagnostics;
 use anyhow::{Result, bail};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};

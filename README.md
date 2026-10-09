@@ -1,4 +1,10 @@
-# Wireless Mic PoC v0.5
+# Wireless Mic PoC v0.5.2
+
+## v0.5.2 Windows audio timing
+
+Simulator now uses an isolated absolute-deadline transmitter with Windows high-resolution waitable timers and MMCSS Audio scheduling. Optional monotonic JSONL diagnostics expose TX timing, intentional skips and send errors. PCM wire format and ESP32 pairing remain unchanged. Dashboard adds real TX/RX packet-rate and drift charts, browser-local/UTC time selection, and distinguishes playout deficits from proven network loss.
+
+Measured hidden-background Release runs sustained approximately 100 packets/s, including ten minutes. Occasional playback callback underruns remain; foreground/minimized/switching and human listening are **Pending Manual Verification**. See [audio stability](docs/audio-stability.md), [BUG-001 evidence and test commands](docs/bug-001-windows-background-timing.md), and the generated `artifacts/bug-001-results.json`.
 
 ESP32-WROOM-32 軟體產生測試音訊，透過 Wi-Fi UDP 傳至 Windows Rust 核心，由一般喇叭／耳機播放。Angular 繁體中文控制台只管理裝置；關閉瀏覽器不會停止音訊。不使用實體麥克風、虛擬音訊裝置、雲端、帳號或資料庫。
 

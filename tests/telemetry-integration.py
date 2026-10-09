@@ -42,6 +42,10 @@ try:
  pair_start('tx-a');wait(lambda:len([s for s in history()['snapshots'] if s['received_packets_delta'] is not None])>=3)
  valid=[s for s in history()['snapshots'] if s['received_packets_delta'] is not None]
  check(all(500<=s['interval_ms']<=1500 and 0<=s['packet_loss_rate']<=100 for s in valid),'real per-second intervals and finite loss')
+ wait(lambda:any(s.get('tx') is not None for s in history()['snapshots']))
+ measured=next(s for s in reversed(history()['snapshots']) if s.get('tx') is not None)
+ check(measured['tx']['successfully_sent_packets']>0 and measured['tx']['intentional_loss_drops']>0 and measured['tx_packet_rate'] is not None,'signed real TX timing survives history serialization')
+ check(measured['rx_packet_rate'] is not None and measured['loss_basis']=='playout_deadline_deficit' and measured['bitrate_basis']=='pcm_payload','rates expose correct deficit and payload basis')
  check(all(s['cumulative']['received_packets']==0 and s['received_packets_delta'] is None for s in history('tx-b')['snapshots']),'idle TX isolated from active TX')
  subprocess.run(['node','--experimental-strip-types',str(ROOT/'tests/telemetry-websocket.mjs'),'http://127.0.0.1:18081','tx-a',str(ROOT/'artifacts/telemetry-websocket-result.json')],check=True,timeout=12)
  check(True,'actual WebSocket reconnect without repeats')

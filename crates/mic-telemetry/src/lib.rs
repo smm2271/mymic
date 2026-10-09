@@ -67,6 +67,8 @@ pub struct DeviceInput {
     pub counters: Counters,
     pub jitter_buffer_depth: usize,
     pub activity_epoch: u64,
+    pub counter_timestamp_ms: Option<u64>,
+    pub tx: Option<mic_protocol::diagnostics::TxTiming>,
 }
 #[derive(Clone)]
 pub struct Inputs {
@@ -102,6 +104,12 @@ pub struct TelemetrySnapshot {
     pub buffer_underruns_per_second: Option<f64>,
     pub cumulative: Counters,
     pub discontinuity: Option<String>,
+    pub loss_basis: &'static str,
+    pub bitrate_basis: &'static str,
+    pub rx_packet_rate: Option<f64>,
+    pub tx_packet_rate: Option<f64>,
+    pub tx_scheduling_drift_ms: Option<f64>,
+    pub tx: Option<mic_protocol::diagnostics::TxTiming>,
 }
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -229,14 +237,25 @@ impl Store {
             } else if !fresh {
                 discontinuity = Some("stale_input".into());
             } else if let Some(previous) = &history.previous {
-                let elapsed = monotonic_ms.checked_sub(previous.monotonic_ms);
+                let elapsed = input
+                    .counter_timestamp_ms
+                    .unwrap_or(monotonic_ms)
+                    .checked_sub(
+                        previous
+                            .input
+                            .counter_timestamp_ms
+                            .unwrap_or(previous.monotonic_ms),
+                    );
                 if input.session_id != previous.input.session_id {
                     discontinuity = Some("session_changed".into());
                 } else if previous.input.connection_state != State::Streaming
                     || input.activity_epoch != previous.input.activity_epoch
                 {
                     discontinuity = Some("stream_transition".into());
-                } else if !elapsed.is_some_and(|ms| (500..=1500).contains(&ms)) {
+                } else if !(500..=1500)
+                    .contains(&monotonic_ms.saturating_sub(previous.monotonic_ms))
+                    || !elapsed.is_some_and(|ms| (500..=1500).contains(&ms))
+                {
                     discontinuity = Some("sampling_gap".into());
                 } else if let Some(d) = input.counters.checked_delta(previous.input.counters) {
                     interval = elapsed;
@@ -275,6 +294,18 @@ impl Store {
                     .zip(seconds)
                     .map(|(d, s)| d.buffer_underruns as f64 / s),
                 cumulative: input.counters,
+                loss_basis: "playout_deadline_deficit",
+                bitrate_basis: "pcm_payload",
+                rx_packet_rate: delta
+                    .zip(seconds)
+                    .map(|(d, s)| d.received_packets as f64 / s),
+                tx_packet_rate: streaming
+                    .then(|| input.tx.as_ref().map(|t| t.packets_per_second))
+                    .flatten(),
+                tx_scheduling_drift_ms: streaming
+                    .then(|| input.tx.as_ref().map(|t| t.scheduling_drift_ms))
+                    .flatten(),
+                tx: input.tx.clone(),
                 discontinuity,
             };
             if history.snapshots.len() == CAPACITY {
@@ -515,6 +546,8 @@ mod tests {
             },
             jitter_buffer_depth: 3,
             activity_epoch: 0,
+            counter_timestamp_ms: None,
+            tx: None,
         }
     }
     fn feed(store: &mut Store, d: DeviceInput, t: u64) {
@@ -716,5 +749,50 @@ mod tests {
         ));
         task.abort();
         let _ = task.await;
+    }
+}
+
+#[cfg(test)]
+mod acquisition_tests {
+    use super::*;
+    #[test]
+    fn rates_use_counter_acquisition_interval_not_later_sampler_wakeup() {
+        let mut store = Store::new();
+        let mut input = DeviceInput {
+            device_id: "sim".into(),
+            session_id: Some("a".into()),
+            connection_state: State::Streaming,
+            counters: Counters::default(),
+            jitter_buffer_depth: 3,
+            activity_epoch: 0,
+            counter_timestamp_ms: Some(0),
+            tx: None,
+        };
+        store.sample(
+            &Inputs {
+                devices: vec![input.clone()],
+                updated: Instant::now(),
+            },
+            0,
+            0,
+            true,
+        );
+        input.counter_timestamp_ms = Some(750);
+        input.counters.received_packets = 75;
+        input.counters.received_bytes = 75 * 320;
+        store.sample(
+            &Inputs {
+                devices: vec![input],
+                updated: Instant::now(),
+            },
+            1000,
+            1000,
+            true,
+        );
+        let h = store.history("sim", Range::Seconds60, 1000).unwrap();
+        let s = h.snapshots.last().unwrap();
+        assert_eq!(s.rx_packet_rate, Some(100.0));
+        assert_eq!(s.receive_bitrate, Some(256000.0));
+        assert!(s.tx_packet_rate.is_none());
     }
 }

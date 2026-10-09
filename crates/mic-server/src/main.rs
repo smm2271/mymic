@@ -280,10 +280,12 @@ async fn main() -> anyhow::Result<()> {
     };
     let (core, task, stop) = Core::start(config).await?;
     let playback = core.playback.clone();
-    match tokio::task::spawn_blocking(move || playback.select("default")).await? {
-        Ok(name) => println!("Audio output: {name}"),
-        Err(e) => eprintln!("Audio output unavailable: {e}"),
-    };
+    if std::env::var("MIC_DISABLE_AUDIO").as_deref() != Ok("1") {
+        match tokio::task::spawn_blocking(move || playback.select("default")).await? {
+            Ok(name) => println!("Audio output: {name}"),
+            Err(e) => eprintln!("Audio output unavailable: {e}"),
+        };
+    }
     let origins = vec![
         format!("http://127.0.0.1:{http}"),
         format!("http://localhost:{http}"),

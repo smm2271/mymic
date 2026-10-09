@@ -8,5 +8,6 @@ tokio.workspace = true
 rand.workspace = true
 hex.workspace = true
 mic-device = { path = "../mic-device" }
+mic-protocol = { path = "../mic-protocol" }
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
