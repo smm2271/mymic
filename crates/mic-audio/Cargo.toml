@@ -1,0 +1,10 @@
+[package]
+name = "mic-audio"
+version = "0.4.0"
+edition = "2024"
+[dependencies]
+serde.workspace = true
+anyhow.workspace = true
+cpal = "0.15.3"
+crossbeam-queue = "0.3"
+mic-protocol = { path = "../mic-protocol" }

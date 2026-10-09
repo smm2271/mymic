@@ -1,0 +1,18 @@
+[package]
+name = "mic-server"
+version = "0.4.0"
+edition = "2024"
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+hex.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }
+mic-network = { path = "../mic-network" }
+mic-audio = { path = "../mic-audio" }
+mic-protocol = { path = "../mic-protocol" }
+
+futures-util = { version = "0.3", features = ["sink"] }

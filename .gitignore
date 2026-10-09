@@ -1,1 +1,11 @@
-/target
+/target/
+**/node_modules/
+**/dist/
+**/.angular/
+firmware/**/build/
+firmware/**/sdkconfig
+firmware/**/sdkconfig.old
+firmware/**/sdkconfig.local
+*.log
+.env
+artifacts/

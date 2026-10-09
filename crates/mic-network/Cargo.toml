@@ -1,0 +1,15 @@
+[package]
+name = "mic-network"
+version = "0.4.0"
+edition = "2024"
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+hex.workspace = true
+sha2.workspace = true
+mic-protocol = { path = "../mic-protocol" }
+mic-device = { path = "../mic-device" }
+mic-audio = { path = "../mic-audio" }

@@ -1,0 +1,10 @@
+[package]
+name = "mic-simulator"
+version = "0.4.0"
+edition = "2024"
+[dependencies]
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+mic-protocol = { path = "../mic-protocol" }
