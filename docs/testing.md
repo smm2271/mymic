@@ -84,3 +84,28 @@ python -X utf8 tests/soak.py --hours 4
 每5秒將devices、metrics與UTC+8時刻寫入 `artifacts/soak.jsonl`，驗證有STREAMING device且received持續增加；它不取代聽測，也不證明四小時沒有聲學glitch。任何failed observation回nonzero，需釐清網路、音訊、source狀態。
 
 延遲定義：起點是TX generator產生指定首樣本，終點為speaker/headphone聲學輸出對應波形的錄音時刻。需同時的reference trigger與獨立audio recording／儀器，涵蓋Wi-Fi、jitter、SRC、WASAPI及硬體。若只量sender monotonic→receiver arrival，應報network latency，不能稱end-to-end；本次没有可校準測量。
+
+
+## v0.5驗證（2026-10-10，Asia/Taipei）
+
+* Rust `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`通過。
+* `cargo test --workspace --locked`：**23項通過**（原13項＋Telemetry9項＋Core/history隔離1項）。Telemetry測1秒cadence、900筆上限、15分鐘TTL、Session與counter reset、採樣gap、停止／秒內stop-start、range filtering、device isolation、event capacity/TTL、weighted60秒loss、slow subscriber lag。
+* 隔離測試持有history寫鎖，真實UDP配對／發包，Audio Engine仍接收至少110／120包；sampling與history阻塞不回壓音訊actor。
+* Rust production：`cargo build --workspace --release --locked`通過。
+* Angular production：`npm.cmd run build --prefix web/angular`通過，initial bundle约449.1kB，低於500kB budget。
+* Angular model：`npm.cmd test --prefix web/angular` **9项檢查通過**，用實際history-model.ts驗證refresh restore、REST/live競爭、reconnect dedup、device切換、boot更換、900 capacity、weighted loss與event dedup；fixtures只存在tests，不用於dashboard。
+* v0.4 `tests/integration.py` **34項回歸檢查通過**，原配對／串流／播放／重連仍正常。
+* `tests/telemetry-integration.py` 使用Release binaries，**37項檢查通過**：非法query統一400、unknown404、真1秒樣本、idle nullable、TX isolation、真WS重連／HTTP history去重、無UI採樣、串流不中斷、新nonce/newSession/reconnect events、stop nullable、A/B擁有權切換、三種range及時間排序。結果 `artifacts/telemetry-integration-result.json`。
+* C/Rust golden tests通過；`git diff -- firmware crates/mic-protocol`為空，ESP32音訊封包未改動。
+
+Chrome手動驗證實際服務資料：
+
+* 4張真實曲線，每11包丟1包的Simulator fixture产生约9% loss；不是前端fake data。
+* refresh前123筆，refresh後130筆，從Core恢復；切到未串流B時累積received0，rate/depth顯示無資料。
+* 60秒與5分鐘時間軸切換，UTC數值tooltip、STOP_STREAM線提示type/device/session，停止後不假造0速率。
+* 390×844 viewport，圖表單欄；document clientWidth=375、scrollWidth=375，沒有horizontal overflow；已還原viewport override。
+* Browser error logs為空。截图 `artifacts/telemetry-dashboard.png`、`artifacts/telemetry-mobile.png`；結果 `artifacts/telemetry-browser-result.json`。
+
+v0.5未新增硬體／聲學／延遲實測；900筆/TTL透過可控制時間的unit tests驗證，不宣稱已跑15分鐘或4小時Wi-Fi實機soak。事件ring每台4096固定上限，極高事件量會較早淘汰最舊事件，詳細見telemetry契約。
+
+可重跑全部：`powershell -ExecutionPolicy Bypass -File scripts/verify.ps1`，需要cargo、Node.js24、Python、GCC與可用Windowsoutput。整合程序在finally結束；本次瀏覽器測試程序也會清理，不留下背景服務。

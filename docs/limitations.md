@@ -31,3 +31,8 @@
 5. 使用bandlimited/adaptive resampler、WASAPI buffer調整、完整anti-replay與更穩定output IDs。
 
 本次範圍不包含實體麥克風、虛擬麥克風、VB-CABLE、Discord／OBS輸入整合。
+
+
+## v0.5監測界限
+
+每台TX最多900 snapshots／4096 events，history15分鐘記憶體保存；Core重啟會清空。大量切換可提前淘汰最舊event，producer queue溢出以dropped_event_inputs報告。排程停頓、counter reset或Session切換的第一個區間顯示null，不估算補齊。保留v0.4同時一台音訊TX限制；其他TX仍可各自採樣，不能以多台監測支援推論支援混音。UTC採用OS時鐘，間隔採monotonic；沒有跨ESP32／Windows clock synchronization或新增延遲量測。圖表與資料通道已以模擬器／瀏覽器驗證，尚非實機Wi-Fi耐久測試。

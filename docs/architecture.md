@@ -34,3 +34,8 @@ Rust Core 有 oneshot cancellation，結束時回覆 pending requests、盡力�
 * [CPAL 0.15.3](https://docs.rs/cpal/0.15.3/cpal/)：裝置配置及 output callback。
 * [ESP-IDF Wi-Fi API](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/network/esp_wifi.html)：STA、事件與 power saving。
 * [Microsoft timeBeginPeriod](https://learn.microsoft.com/en-us/windows/win32/api/timeapi/nf-timeapi-timebeginperiod)：timer request 必須成對釋放。
+
+
+## v0.5監測隔離
+
+新增 `mic-telemetry`，Core按actual streaming owner歸屬counters，latest watch與bounded event queue送到獨立1秒sampler；API history lock只在sampler/API task使用，Audio Engine不等歷史查詢。每device snapshot ring900／event ring4096，TTL15分鐘；WS broadcast ring128及write timeout，不回壓actor。細節见 [telemetry.md](telemetry.md)。

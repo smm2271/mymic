@@ -97,3 +97,8 @@ version|kind|request_id|device_id|nonce|session|audio_port|control_port|source|g
 正常為200；schema/credential錯誤400、Origin/token錯誤403、裝置不存在404、控制競爭／未連線409、控制timeout504。JSON 拒絕／domain錯誤統一 `{error:{code:number,message:string}}`；HTTP parser／WebSocket upgrade 的底層 rejection 可能使用框架格式。Body 上限4096。
 
 Metrics：received_packets、lost_packets、out_of_order_packets、duplicate_packets、receive_bitrate（啟動後累積平均、有效 audio datagram bytes，不含 UDP/IP/Wi-Fi overhead）、jitter_buffer_depth（包數）、buffer_underruns、buffer_overruns、invalid_packets、output_state。Underrun 合計缺包 playout deadlines 和播放 callback starvation 次數，**不是同一單位的樣本數**。統計不能用來聲稱端到端音訊延遲。
+
+
+## v0.5 Telemetry（不改wire protocol）
+
+新增 `GET /api/v1/telemetry/history?device_id=...&range=60s|5m|15m` 與同WebSocket的 `telemetry_snapshot`／`telemetry_event`／`resync_required` 訊息。既有status snapshot及 `/metrics` 保留為累積legacy統計，不作為每台TX每秒速率。UTC timestamp、nullable值、相鄰差值、事件與query驗證契約見 [telemetry.md](telemetry.md)。

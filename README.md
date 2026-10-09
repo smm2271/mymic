@@ -1,8 +1,14 @@
-# Wireless Mic PoC v0.4
+# Wireless Mic PoC v0.5
 
 ESP32-WROOM-32 軟體產生測試音訊，透過 Wi-Fi UDP 傳至 Windows Rust 核心，由一般喇叭／耳機播放。Angular 繁體中文控制台只管理裝置；關閉瀏覽器不會停止音訊。不使用實體麥克風、虛擬音訊裝置、雲端、帳號或資料庫。
 
 專案位於既有 `mymic/rx` Repository，保留原有 `src/main.rs` Hello World；實際接收服務是 **`mic-server`**，不要直接使用不帶 `-p` 的 `cargo run`。
+
+## v0.5 即時監測
+
+Rust每秒採樣，每台TX保存最近15分鐘（900筆）history；新增四張Chart.js折線圖、UTC hover、START/STOP／disconnect/reconnect／Session事件線、60秒／5分鐘／15分鐘與裝置切換。頁面重新整理／WebSocket重連從核心恢復歷史，關閉UI不影響採樣。儀表板主指標為**最近60秒封包遺失率**，累積統計在詳細資訊。停止或不連續區間用無資料，不填假零。
+
+新增API：`GET /api/v1/telemetry/history?device_id=sim-01&range=60s`；完整schema見 [docs/telemetry.md](docs/telemetry.md)。音訊封包／ESP32韌體未改動。
 
 ## 快速啟動（Windows PowerShell）
 
@@ -48,6 +54,9 @@ ESP32 安裝與燒錄：在 ESP-IDF 終端進入 `firmware/esp32-tx`，執行 `i
 ```powershell
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace --release
+node --experimental-strip-types tests/history-model.mjs
+python -X utf8 tests/telemetry-integration.py
 cargo fmt --all -- --check
 python -X utf8 tests/integration.py
 powershell -ExecutionPolicy Bypass -File tests/host/run.ps1
@@ -61,6 +70,7 @@ powershell -ExecutionPolicy Bypass -File tests/host/run.ps1
 |---|---|
 | `crates/mic-protocol` | 版本化 JSON 控制、HMAC、PCM binary、測試訊號 |
 | `crates/mic-device` | 裝置狀態及合法轉換 |
+| `crates/mic-telemetry` | 每秒採樣、固定容量history、UTC事件、broadcast |
 | `crates/mic-network` | UDP、明確核准配對、Session、重試與重連 |
 | `crates/mic-audio` | jitter buffer、無鎖播放佇列、重取樣、CPAL/WASAPI |
 | `crates/mic-server` | 本機 REST、WebSocket、Angular 靜態資源 |
