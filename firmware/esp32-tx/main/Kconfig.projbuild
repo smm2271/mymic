@@ -1,0 +1,19 @@
+menu "Wireless microphone PoC"
+config MIC_WIFI_SSID
+    string "Wi-Fi SSID (local sdkconfig only)"
+    default ""
+config MIC_WIFI_PASSWORD
+    string "Wi-Fi password (local sdkconfig only)"
+    default ""
+config MIC_DEVICE_NAME
+    string "Device name"
+    default "ESP32 Software TX"
+config MIC_DISCOVERY_PORT
+    int "Discovery UDP port"
+    range 1024 65535
+    default 41000
+config MIC_CONTROL_PORT
+    int "Device control UDP port"
+    range 1024 65535
+    default 41001
+endmenu
