@@ -1,12 +1,12 @@
 {
   "name": "mic-ui",
-  "version": "0.0.0",
+  "version": "0.5.0",
   "scripts": {
     "ng": "ng",
     "start": "ng serve",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
-    "test": "ng test"
+    "test": "node --experimental-strip-types ../../tests/history-model.mjs"
   },
   "private": true,
   "packageManager": "npm@11.16.0",
@@ -17,6 +17,8 @@
     "@angular/forms": "^22.0.0",
     "@angular/platform-browser": "^22.0.0",
     "@angular/router": "^22.0.0",
+    "chart.js": "^4.5.1",
+    "chartjs-plugin-annotation": "^3.1.0",
     "rxjs": "~7.8.0",
     "tslib": "^2.3.0"
   },
@@ -26,5 +28,6 @@
     "@angular/compiler-cli": "^22.0.0",
     "prettier": "^3.8.1",
     "typescript": "~6.0.2"
-  }
+  },
+  "type": "module"
 }

@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import {emptyHistory,restoreHistory,appendSnapshot,appendEvent,loss60} from '../web/angular/src/app/history-model.ts';
+const sample=(n,id='a',session='one')=>({id:`boot:${n}:${id}`,sequence:n,timestamp:n*1000,device_id:id,session_id:session,received_packets_delta:90,lost_packets_delta:10});
+const response=(items,stream='boot',id='a')=>({stream_id:stream,device_id:id,range:'15m',generated_at:items.at(-1)?.timestamp||0,snapshots:items,events:[]});
+let state=restoreHistory(emptyHistory('a'),response([sample(1),sample(2)]));
+state=appendSnapshot(state,'boot',sample(3));
+state=restoreHistory(state,response([sample(1),sample(2),sample(3)]));
+assert.equal(state.snapshots.length,3);console.log('PASS history response merges live race and deduplicates stable IDs');
+assert.deepEqual(restoreHistory(emptyHistory('a'),response(state.snapshots)).snapshots,state.snapshots);console.log('PASS fresh frontend restores full server history');
+state=appendSnapshot(state,'boot',sample(3));assert.equal(state.snapshots.length,3);console.log('PASS WebSocket reconnect duplicate suppressed');
+assert.equal(appendSnapshot(state,'boot',sample(4,'b')),state);console.log('PASS selected device isolation');
+state=restoreHistory(state,response([sample(4,'b')],'boot','b'));assert.equal(state.deviceId,'b');assert.equal(state.snapshots.length,1);console.log('PASS device switch clears other TX data');
+state=appendSnapshot(state,'new-boot',sample(5,'b'));assert.equal(state.snapshots.length,1);assert.equal(state.streamId,'new-boot');console.log('PASS server restart resets old boot history');
+state=emptyHistory('a');for(let n=0;n<2000;n++)state=appendSnapshot(state,'boot',sample(n));assert.equal(state.snapshots.length,900);console.log('PASS browser history remains bounded to 900 samples');
+assert.equal(loss60(state),10);const noData={...sample(2000),received_packets_delta:null,lost_packets_delta:null};state=appendSnapshot(state,'boot',noData);assert.equal(loss60(state),10);console.log('PASS rolling loss uses deltas and ignores non-applicable values');
+let event={id:'event1',sequence:1,timestamp:2000000,device_id:'a',event_type:'STOP_STREAM'};state=appendEvent(state,'boot',event);state=appendEvent(state,'boot',event);assert.equal(state.events.length,1);console.log('PASS event IDs deduplicated');

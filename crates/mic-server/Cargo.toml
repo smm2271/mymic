@@ -1,6 +1,6 @@
 [package]
 name = "mic-server"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 [dependencies]
 tokio.workspace = true
@@ -16,3 +16,5 @@ mic-audio = { path = "../mic-audio" }
 mic-protocol = { path = "../mic-protocol" }
 
 futures-util = { version = "0.3", features = ["sink"] }
+
+mic-telemetry = { path = "../mic-telemetry" }

@@ -722,13 +722,14 @@ dependencies = [
 
 [[package]]
 name = "mic-network"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "hex",
  "mic-audio",
  "mic-device",
  "mic-protocol",
+ "mic-telemetry",
  "rand 0.8.8",
  "serde",
  "serde_json",
@@ -751,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "mic-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -760,6 +761,7 @@ dependencies = [
  "mic-audio",
  "mic-network",
  "mic-protocol",
+ "mic-telemetry",
  "rand 0.8.8",
  "serde",
  "serde_json",
@@ -775,6 +777,17 @@ dependencies = [
  "mic-protocol",
  "rand 0.8.8",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mic-telemetry"
+version = "0.5.0"
+dependencies = [
+ "hex",
+ "mic-device",
+ "rand 0.8.8",
+ "serde",
  "tokio",
 ]
 

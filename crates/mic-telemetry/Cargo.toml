@@ -1,0 +1,12 @@
+[package]
+name = "mic-telemetry"
+version = "0.5.0"
+edition = "2024"
+[dependencies]
+serde.workspace = true
+tokio.workspace = true
+rand.workspace = true
+hex.workspace = true
+mic-device = { path = "../mic-device" }
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

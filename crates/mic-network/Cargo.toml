@@ -1,6 +1,6 @@
 [package]
 name = "mic-network"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 [dependencies]
 serde.workspace = true
@@ -13,3 +13,5 @@ sha2.workspace = true
 mic-protocol = { path = "../mic-protocol" }
 mic-device = { path = "../mic-device" }
 mic-audio = { path = "../mic-audio" }
+
+mic-telemetry = { path = "../mic-telemetry" }

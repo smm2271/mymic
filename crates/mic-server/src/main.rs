@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, Request, State, WebSocketUpgrade, ws::Message as WsMessage},
+    extract::{Path, Query, Request, State, WebSocketUpgrade, ws::Message as WsMessage},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -9,6 +9,7 @@ use axum::{
 use futures_util::SinkExt;
 use mic_network::{Action, Config, Core, validate_audio};
 use mic_protocol::Source;
+use mic_telemetry::{Range, valid_device_id};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
@@ -202,13 +203,45 @@ async fn output(
         .map_err(bad)?;
     Ok(Json(json!({"name":name})))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryQuery {
+    device_id: String,
+    range: String,
+}
+async fn history(
+    State(a): State<App>,
+    query: Result<Query<HistoryQuery>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult {
+    let Query(q) = query.map_err(bad)?;
+    if !valid_device_id(&q.device_id) {
+        return Err(bad("invalid device_id"));
+    }
+    let range = Range::parse(&q.range).ok_or_else(|| bad("range must be 60s, 5m or 15m"))?;
+    let history = a
+        .core
+        .telemetry
+        .history(&q.device_id, range)
+        .await
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "device telemetry not found".into()))?;
+    Ok(Json(json!(history)))
+}
 async fn events(State(a): State<App>, ws: WebSocketUpgrade) -> Response {
     ws.max_message_size(4096).max_frame_size(4096).on_upgrade(move |mut socket| async move {
   let mut timer=tokio::time::interval(Duration::from_millis(500));
   let mut shutdown=a.shutdown.clone();
+  let mut telemetry=a.core.telemetry.notifications.subscribe();
   loop {
    tokio::select! {
     _=shutdown.changed()=>{let _=socket.send(WsMessage::Close(None)).await;break;},
+    notification=telemetry.recv()=>{
+     let message=match notification {
+      Ok(note)=>serde_json::to_string(&note).unwrap(),
+      Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>json!({"kind":"resync_required"}).to_string(),
+      Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
+     };
+     if !matches!(tokio::time::timeout(Duration::from_secs(2),socket.send(WsMessage::Text(message.into()))).await,Ok(Ok(()))){break;}
+    },
     _=timer.tick()=>{
      let snapshot=a.core.snapshot.read().await.clone();
      let send=socket.send(WsMessage::Text(serde_json::to_string(&snapshot).unwrap().into()));
@@ -273,6 +306,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/audio/outputs", get(outputs))
         .route("/api/v1/audio/output", put(output))
         .route("/api/v1/metrics", get(metrics))
+        .route("/api/v1/telemetry/history", get(history))
         .route("/api/v1/events", get(events))
         .fallback_service(tower_http::services::ServeDir::new(
             "web/angular/dist/mic-ui/browser",
