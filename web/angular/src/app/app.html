@@ -1,0 +1,20 @@
+<main>
+<header><div><span class="eyebrow">WIRELESS MIC / PoC v0.4</span><h1>無線音訊控制台</h1><p>ESP32 → Wi-Fi → Windows 音訊輸出</p></div><span class="status" [class.good]="online()">{{ online() ? '核心服務在線' : '核心服務離線' }}</span></header>
+@if(error()){<div class="error" role="alert">{{error()}}</div>}
+<section class="stats" aria-label="即時音訊統計">
+<div><span>接收封包</span><strong>{{metrics()['received_packets'] ?? '—'}}</strong></div>
+<div><span>封包遺失率</span><strong>{{loss()}}<small>%</small></strong></div>
+<div><span>平均接收速率</span><strong>{{((metrics()['receive_bitrate']||0)/1000).toFixed(1)}}<small>kbps</small></strong></div>
+<div><span>Jitter buffer</span><strong>{{metrics()['jitter_buffer_depth'] ?? '—'}}<small>封包</small></strong></div>
+</section>
+<section class="panel"><div class="section-head"><h2>Windows 音訊輸出</h2><span>{{socketState()}}</span></div><div class="output"><select aria-label="選擇音訊輸出裝置" [(ngModel)]="output" [disabled]="!online()"><option value="default">系統預設</option>@for(o of outputs();track o.id){<option [value]="o.id">{{o.name}}{{o.is_default?'（預設）':''}}</option>}</select><button (click)="selectOutput()" [disabled]="!online()||busy()!==''">套用輸出</button></div><p>目前輸出：{{metrics()['output_state']||'尚未取得'}}</p></section>
+<section class="panel"><div class="section-head"><h2>發射裝置 <small>{{devices().length}}</small></h2><span>探索與配對</span></div>
+@if(devices().length===0){<div class="empty"><strong>等待發射器</strong><p>啟動 ESP32 或軟體模擬器，裝置會自動出現在這裡。</p></div>}
+@for(d of devices();track d.id){<article><div class="device-head"><div><h3>{{d.name}}</h3><p>{{d.id}} · {{d.device_type}} · {{d.address}}</p></div><span class="status" [class.good]="d.state==='STREAMING'">{{labels[d.state]||d.state}}</span></div>
+@if(d.last_error){<p class="warning">{{d.last_error}}</p>}
+@if(d.state==='DISCOVERED'){<label>裝置端顯示的一次性配對憑證<input [(ngModel)]="code[d.id]" type="password" maxlength="32" placeholder="32 位十六進位憑證" autocomplete="off"></label><div class="actions"><button (click)="pair(d)" [disabled]="busy()!==''||!online()">核准配對</button><button class="secondary" (click)="reject(d)" [disabled]="busy()!==''||!online()">拒絕</button></div>}
+@if(d.state==='CONNECTED'||d.state==='STREAMING'){<div class="controls"><label>測試音訊<select aria-label="測試音訊" [ngModel]="d.source" (ngModelChange)="audio(d,{source:$event})" [disabled]="busy()!==''||!online()">@for(s of sources;track s.id){<option [value]="s.id">{{s.name}}</option>}</select></label><label>增益 {{(d.gain*100).toFixed(0)}}%<input type="range" min="0" max="1" step="0.01" [value]="d.gain" (change)="audio(d,{gain:+$any($event.target).value})" [disabled]="busy()!==''||!online()"></label></div><div class="actions"><button (click)="audio(d,{streaming:d.state!=='STREAMING'})" [disabled]="busy()!==''||!online()">{{d.state==='STREAMING'?'停止串流':'啟動串流'}}</button><button class="secondary" (click)="audio(d,{mute:!d.mute})" [disabled]="busy()!==''||!online()">{{d.mute?'取消靜音':'靜音'}}</button><button class="secondary" (click)="disconnect(d)" [disabled]="busy()!==''||!online()">中斷連線</button></div>}
+@if(d.state==='PAIRING'){<p>正在驗證配對，請稍候…</p>}
+<details><summary>裝置與傳輸詳情</summary><p>支援來源：{{d.capabilities.join('、')}}</p><p>格式：PCM S16LE · 16 kHz · 單聲道 · 每包 10 ms</p></details></article>}
+</section><footer>音訊由 Rust 核心獨立處理，關閉此頁面仍會持續播放。增益上限已限制，初次測試請先降低喇叭音量。<br>遺失 {{metrics()['lost_packets']||0}} · 重複 {{metrics()['duplicate_packets']||0}} · 亂序 {{metrics()['out_of_order_packets']||0}} · Buffer underrun {{metrics()['buffer_underruns']||0}} · Overrun {{metrics()['buffer_overruns']||0}}</footer>
+</main>
