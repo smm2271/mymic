@@ -25,6 +25,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Integration failed' }
     python -X utf8 tests/telemetry-integration.py
     if ($LASTEXITCODE -ne 0) { throw 'Telemetry integration failed' }
+    python -X utf8 tests/diagnostics-integration.py
+    if ($LASTEXITCODE -ne 0) { throw 'Continuity diagnostics integration failed' }
     & tests/host/run.ps1
     if ($LASTEXITCODE -ne 0) { throw 'C host test failed' }
 } finally { Pop-Location }
