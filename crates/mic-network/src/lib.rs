@@ -135,7 +135,7 @@ impl Core {
         let discovery = UdpSocket::bind(("0.0.0.0", config.discovery)).await?;
         let control_socket = UdpSocket::bind(("0.0.0.0", config.control)).await?;
         let audio = UdpSocket::bind(("0.0.0.0", config.audio)).await?;
-        let engine = Engine::new(config.jitter);
+        let engine = Engine::with_options(config.jitter, mic_audio::IsolationOptions::from_env()?);
         let playback = engine.playback.clone();
         let snapshot = Arc::new(RwLock::new(Snapshot {
             devices: vec![],

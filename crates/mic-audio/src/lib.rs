@@ -164,6 +164,9 @@ impl Resampler {
 }
 #[derive(Default, Clone, Serialize, Debug)]
 pub struct Metrics {
+    pub output_diagnostics: output::OutputSnapshot,
+    pub rx_authenticated_packet_age_ms: Option<f64>,
+    pub jitter_missing_samples_fed: u64,
     pub received_packets: u64,
     pub lost_packets: u64,
     pub out_of_order_packets: u64,
@@ -202,7 +205,40 @@ pub struct Metrics {
     pub inter_arrival_jitter_ms: f64,
     pub inter_arrival_interval_ms: Option<f64>,
 }
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct IsolationOptions {
+    pub output_fade: bool,
+    pub capacity_policy: bool,
+    pub recovery_policy: bool,
+}
+impl Default for IsolationOptions {
+    fn default() -> Self {
+        Self {
+            output_fade: true,
+            capacity_policy: true,
+            recovery_policy: true,
+        }
+    }
+}
+impl IsolationOptions {
+    pub fn from_env() -> Result<Self> {
+        fn flag(name: &str) -> Result<bool> {
+            match std::env::var(name) {
+                Err(std::env::VarError::NotPresent) => Ok(true),
+                Ok(v) if v == "on" => Ok(true),
+                Ok(v) if v == "off" => Ok(false),
+                _ => Err(anyhow!("{name} must be on or off")),
+            }
+        }
+        Ok(Self {
+            output_fade: flag("MIC_TEST_OUTPUT_FADE")?,
+            capacity_policy: flag("MIC_TEST_CAPACITY_POLICY")?,
+            recovery_policy: flag("MIC_TEST_RECOVERY_POLICY")?,
+        })
+    }
+}
 pub struct Jitter {
+    capacity_policy: bool,
     packets: HashMap<u32, AudioPacket>,
     expected: Option<u32>,
     pub started: bool,
@@ -219,6 +255,7 @@ impl Jitter {
     pub fn new(depth: usize) -> Self {
         let depth = depth.clamp(2, 4);
         Self {
+            capacity_policy: true,
             packets: HashMap::new(),
             expected: None,
             started: false,
@@ -273,6 +310,10 @@ impl Jitter {
             .count()
     }
     pub fn push(&mut self, p: AudioPacket) {
+        if !self.capacity_policy {
+            self.push_legacy(p);
+            return;
+        }
         self.metrics.received_packets += 1;
         if self.seen.contains(&p.sequence) || self.packets.contains_key(&p.sequence) {
             self.metrics.duplicate_packets += 1;
@@ -347,6 +388,71 @@ impl Jitter {
         self.packets.insert(p.sequence, p);
         self.metrics.jitter_buffer_depth = self.packets.len();
         self.metrics.contiguous_playable_depth = self.contiguous_playable_depth();
+    }
+    fn push_legacy(&mut self, p: AudioPacket) {
+        self.metrics.received_packets += 1;
+        if self.seen.contains(&p.sequence) {
+            self.metrics.duplicate_packets += 1;
+            return;
+        }
+        self.seen.push_back(p.sequence);
+        if self.seen.len() > 64 {
+            self.seen.pop_front();
+        }
+        if let Some(e) = self.expected {
+            if ahead(e, p.sequence) {
+                self.metrics.out_of_order_packets += 1;
+                if !self.started && e.wrapping_sub(p.sequence) < 8 {
+                    self.expected = Some(p.sequence)
+                } else {
+                    self.metrics.late_packet_drops += 1;
+                    self.event(
+                        diagnostics::EventType::LatePacket,
+                        Some(p.sequence),
+                        Some(e),
+                        "behind_playout_cursor",
+                    );
+                    return;
+                }
+            } else if p.sequence != e.wrapping_add(self.packets.len() as u32) {
+                self.metrics.out_of_order_packets += 1;
+            }
+        } else {
+            self.expected = Some(p.sequence)
+        }
+        if self.packets.len() >= 8 {
+            self.event(
+                diagnostics::EventType::BufferResync,
+                Some(p.sequence),
+                self.expected,
+                "jitter_capacity",
+            );
+            self.recovering = true;
+            self.metrics.buffer_overruns += 1;
+            self.metrics.jitter_buffer_drops += self.packets.len() as u64;
+            self.packets.clear();
+            self.expected = Some(p.sequence);
+            self.started = false;
+        }
+        if self
+            .expected
+            .is_some_and(|e| p.sequence.wrapping_sub(e) > 100 && ahead(p.sequence, e))
+        {
+            self.event(
+                diagnostics::EventType::BufferResync,
+                Some(p.sequence),
+                self.expected,
+                "forward_sequence_jump",
+            );
+            self.recovering = true;
+            self.packets.clear();
+            self.expected = Some(p.sequence);
+            self.started = false;
+            self.metrics.buffer_overruns += 1;
+        }
+        self.metrics.accepted_packets += 1;
+        self.packets.insert(p.sequence, p);
+        self.metrics.jitter_buffer_depth = self.packets.len();
     }
     pub fn tick(&mut self) -> [i16; 160] {
         if !self.started {
@@ -432,6 +538,8 @@ struct Select {
 }
 #[derive(Clone)]
 pub struct Playback {
+    pub isolation: IsolationOptions,
+    output_diagnostics: Arc<output::Counters>,
     queue: Arc<ArrayQueue<output::Input>>,
     epoch: Arc<AtomicU64>,
     active: Arc<AtomicBool>,
@@ -467,10 +575,15 @@ impl Playback {
             .collect())
     }
     pub fn new() -> Self {
+        Self::with_options(IsolationOptions::default())
+    }
+    pub fn with_options(isolation: IsolationOptions) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Select>(4);
         let diagnostics = diagnostics::Diagnostics::new();
         let capture = capture::Capture::new(diagnostics.clone());
         let p = Self {
+            isolation,
+            output_diagnostics: Arc::new(output::Counters::default()),
             queue: Arc::new(ArrayQueue::new(1600)),
             epoch: Arc::new(AtomicU64::new(0)),
             active: Arc::new(AtomicBool::new(false)),
@@ -622,12 +735,15 @@ impl Playback {
         let error_diagnostics = diagnostics.clone();
         let output_rate = c.sample_rate.0;
         let mut monitor = CallbackMonitor::new(output_rate);
-        let mut renderer = output::Renderer::new(output_rate);
+        let mut renderer = output::Renderer::with_options(output_rate, self.isolation);
+        let counters = self.output_diagnostics.clone();
         Ok(d.build_output_stream(
             c,
             move |data: &mut [T], _| {
+                let now = Instant::now();
+                counters.callback(diagnostics.now_us(), output_rate);
                 monitor.begin(
-                    Instant::now(),
+                    now,
                     data.len() / channels,
                     active.load(Ordering::Relaxed) && renderer.primed(),
                     queue.len(),
@@ -636,6 +752,7 @@ impl Playback {
                 output_frames.fetch_add((data.len() / channels) as u64, Ordering::Relaxed);
                 output_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
                 let stats = renderer.render(data, channels, &queue, &active, &epoch);
+                counters.record(&stats);
                 input_samples.fetch_add(stats.consumed, Ordering::Relaxed);
                 if stats.rendered {
                     monitor.finish(stats.short, queue.len(), &diagnostics);
@@ -682,8 +799,12 @@ pub struct Engine {
 }
 impl Engine {
     pub fn new(depth: usize) -> Self {
-        let playback = Playback::new();
+        Self::with_options(depth, IsolationOptions::default())
+    }
+    pub fn with_options(depth: usize, options: IsolationOptions) -> Self {
+        let playback = Playback::with_options(options);
         let mut jitter = Jitter::new(depth);
+        jitter.capacity_policy = options.capacity_policy;
         jitter.diagnostics = Some(playback.diagnostics.clone());
         Self {
             jitter,
@@ -752,6 +873,9 @@ impl Engine {
         let upstream_faded = self.jitter.last_tick_missing || self.declicker.in_underrun;
         let smoothed = self.declicker.process(f, self.jitter.last_tick_missing);
         if self.jitter.started || was_started {
+            if self.jitter.last_tick_missing {
+                self.jitter.metrics.jitter_missing_samples_fed += 160;
+            }
             self.playback.feed_tagged(smoothed, upstream_faded);
         }
     }
@@ -783,6 +907,10 @@ impl Engine {
     }
     pub fn metrics(&self) -> Metrics {
         let mut m = self.jitter.metrics.clone();
+        m.output_diagnostics = self.playback.output_diagnostics.snapshot();
+        m.rx_authenticated_packet_age_ms = self
+            .last_arrival
+            .map(|t| t.elapsed().as_secs_f64() * 1000.0);
         m.receive_bitrate =
             (self.bytes as f64 * 8.0 / self.started.elapsed().as_secs_f64().max(1.0)) as u64;
         m.buffer_underruns += self.playback.underruns.load(Ordering::Relaxed);

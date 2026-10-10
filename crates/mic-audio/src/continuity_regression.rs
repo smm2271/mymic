@@ -517,3 +517,190 @@ fn export_continuity_comparisons() {
     )
     .unwrap();
 }
+
+#[test]
+fn isolation_partial_callback_and_recovery_matrix() {
+    // 320 input samples at 16 kHz; 600 output frames force missing lookahead.
+    // A subsequent 160-sample frame cannot prime either policy (unchanged 320 gate).
+    let mut summary = Vec::new();
+    for fade in [false, true] {
+        for recovery in [false, true] {
+            let q = ArrayQueue::new(1600);
+            let active = AtomicBool::new(true);
+            let epoch = AtomicU64::new(0);
+            let options = IsolationOptions {
+                output_fade: fade,
+                recovery_policy: recovery,
+                ..Default::default()
+            };
+            let mut r = Renderer::with_options(16000, options);
+            put(
+                &q,
+                (0..320).map(|i| (std::f32::consts::TAU * 440.0 * i as f32 / 16000.0).sin() * 0.5),
+                false,
+                0,
+            );
+            let mut out = [0.0f32; 600];
+            let s = r.render(&mut out, 1, &q, &active, &epoch);
+            assert!(s.short);
+            assert_eq!(s.consumed, 320);
+            assert!(out.iter().all(|v| v.is_finite()));
+            if recovery {
+                assert_eq!(s.starvation_frames, 282);
+            }
+            put(&q, [0.5; 160], false, 0);
+            let mut wait = [0.0f32; 160];
+            let w = r.render(&mut wait, 1, &q, &active, &epoch);
+            assert_eq!(w.prefill_frames, 160);
+            assert_eq!(q.len(), 160);
+            put(&q, [0.5; 160], false, 0);
+            let mut resumed = [0.0f32; 160];
+            let next = r.render(&mut resumed, 1, &q, &active, &epoch);
+            assert!(!next.short);
+            assert!(resumed[100] > 0.49);
+            summary.push(serde_json::json!({"fade":fade,"recovery":recovery,"first_zero_frames":s.zero_frames,"first_inserted_frames":s.inserted_frames,"rebuffer_frames":w.prefill_frames,"resumed_consumed":next.consumed}));
+        }
+    }
+    if let Ok(dir) = std::env::var("MIC_ISOLATION_ARTIFACTS") {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            std::path::Path::new(&dir).join("callback-matrix.json"),
+            serde_json::to_vec_pretty(&summary).unwrap(),
+        )
+        .unwrap();
+    }
+}
+#[test]
+fn isolation_capacity_and_epoch_switches_are_independent() {
+    for capacity in [false, true] {
+        let mut j = Jitter::new(3);
+        j.capacity_policy = capacity;
+        for n in 0..9 {
+            j.push(packet(n));
+        }
+        assert_eq!(j.expected_sequence(), Some(if capacity { 0 } else { 8 }));
+        assert_eq!(j.occupancy(), if capacity { 8 } else { 1 });
+    }
+    for recovery in [false, true] {
+        let q = ArrayQueue::new(1600);
+        put(&q, [0.5; 400], false, 0);
+        let mut r = Renderer::with_options(
+            16000,
+            IsolationOptions {
+                output_fade: false,
+                recovery_policy: recovery,
+                ..Default::default()
+            },
+        );
+        let mut out = [0.0f32; 80];
+        r.render(&mut out, 1, &q, &AtomicBool::new(true), &AtomicU64::new(1));
+        assert_eq!(out[40], if recovery { 0.0 } else { 0.5 });
+    }
+}
+#[test]
+fn isolation_final_format_silence_and_interval_accounting() {
+    let q = ArrayQueue::new(1600);
+    let mut r = Renderer::with_options(48000, IsolationOptions::default());
+    let mut out = [0u16; 480];
+    let s = r.render(&mut out, 1, &q, &AtomicBool::new(false), &AtomicU64::new(0));
+    assert!(out.iter().all(|v| *v == 32768));
+    assert_eq!(s.zero_frames, 480);
+    let c = output::Counters::default();
+    c.callback(1000, 48000);
+    c.callback(13000, 48000);
+    c.record(&s);
+    let m = c.snapshot();
+    assert_eq!(m.callback_last_interval_us, 12000);
+    assert_eq!(m.exact_zero_output_us, 10000);
+    assert_eq!(m.inactive_us, 10000);
+}
+
+#[test]
+fn isolation_arrival_during_starved_callback_reproduces_suppressed_audio() {
+    let mut records = Vec::new();
+    for fade in [false, true] {
+        for recovery in [false, true] {
+            let q = ArrayQueue::new(1600);
+            put(&q, [0.5; 320], false, 0);
+            let mut r = Renderer::with_options(
+                16000,
+                IsolationOptions {
+                    output_fade: fade,
+                    recovery_policy: recovery,
+                    ..Default::default()
+                },
+            );
+            let mut out = [0.0f32; 480];
+            let s = r.render_injected(
+                &mut out,
+                &q,
+                &AtomicBool::new(true),
+                &AtomicU64::new(0),
+                |index, q| {
+                    if index == 350 {
+                        put(q, [0.5; 160], false, 0);
+                    }
+                },
+            );
+            assert!(s.short);
+            assert_eq!(out[450], if recovery { 0.0 } else { 0.5 });
+            assert_eq!(q.len(), if recovery { 160 } else { 30 });
+            records.push(serde_json::json!({"fade":fade,"recovery":recovery,"sample_450":out[450],"remaining_input":q.len(),"zero_output_frames":s.zero_frames,"inserted_frames":s.inserted_frames}));
+        }
+    }
+    if let Ok(dir) = std::env::var("MIC_ISOLATION_ARTIFACTS") {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            std::path::Path::new(&dir).join("during-callback-arrival.json"),
+            serde_json::to_vec_pretty(&records).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn isolation_all_switch_combinations_preserve_healthy_440hz_at_device_rates() {
+    for rate in [16000, 44100, 48000] {
+        let mut reference = None;
+        for fade in [false, true] {
+            for recovery in [false, true] {
+                for capacity in [false, true] {
+                    let q = ArrayQueue::new(1600);
+                    let mut j = Jitter::new(3);
+                    j.capacity_policy = capacity;
+                    for n in 0..3 {
+                        j.push(packet(n));
+                    }
+                    for _ in 0..3 {
+                        put(&q, j.tick().map(|s| s as f32 / 32768.0), false, 0);
+                    }
+                    let mut r = Renderer::with_options(
+                        rate,
+                        IsolationOptions {
+                            output_fade: fade,
+                            recovery_policy: recovery,
+                            capacity_policy: capacity,
+                        },
+                    );
+                    let mut waveform = Vec::new();
+                    for n in 3..103 {
+                        j.push(packet(n));
+                        put(&q, j.tick().map(|s| s as f32 / 32768.0), false, 0);
+                        let mut out = vec![0.0f32; (rate / 100) as usize];
+                        let s =
+                            r.render(&mut out, 1, &q, &AtomicBool::new(true), &AtomicU64::new(0));
+                        assert!(!s.short);
+                        assert_eq!(s.inserted_frames, 0);
+                        assert_eq!(j.metrics.lost_packets, 0);
+                        waveform.extend(out);
+                    }
+                    if let Some(ref v) = reference {
+                        assert_eq!(&waveform, v);
+                    } else {
+                        reference = Some(waveform);
+                    }
+                }
+            }
+        }
+    }
+}

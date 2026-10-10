@@ -109,7 +109,7 @@ async fn guard(State(app): State<App>, req: Request, next: Next) -> Response {
 }
 async fn status(State(a): State<App>) -> Json<Value> {
     Json(
-        json!({"service":"online","protocol_version":1,"sample_rate":16000,"frame_ms":10,"api_token":a.token}),
+        json!({"build_commit":env!("MIC_BUILD_COMMIT"),"build_dirty":env!("MIC_BUILD_DIRTY"),"build_version":"v0.6.3-isolation-1","isolation":a.core.playback.isolation,"service":"online","protocol_version":1,"sample_rate":16000,"frame_ms":10,"api_token":a.token}),
     )
 }
 async fn devices(State(a): State<App>) -> Json<Value> {
@@ -305,6 +305,14 @@ fn port(name: &str, default: u16) -> anyhow::Result<u16> {
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|a| a == "--version") {
+        println!(
+            "v0.6.3-isolation-1 commit={} dirty={}",
+            env!("MIC_BUILD_COMMIT"),
+            env!("MIC_BUILD_DIRTY")
+        );
+        return Ok(());
+    }
     let _timer = mic_protocol::TimerResolution::acquire();
     let http = port("MIC_HTTP_PORT", 8080)?;
     let config = Config {
