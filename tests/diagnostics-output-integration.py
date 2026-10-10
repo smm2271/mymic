@@ -26,7 +26,7 @@ def wait(fn):
 
 def launch(name, *args, env=None):
     log = open(ROOT/'artifacts'/f'diagnostics-output-{name}.log', 'w', encoding='utf8')
-    p = subprocess.Popen([str(ROOT/'target/release'/f'{name}.exe'), *args], cwd=ROOT,
+    p = subprocess.Popen([str(ROOT/'target'/os.environ.get('MIC_TEST_PROFILE','release')/f'{name}.exe'), *args], cwd=ROOT,
                          stdout=log, stderr=log, env=env)
     processes.append((p,log))
 

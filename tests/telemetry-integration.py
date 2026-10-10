@@ -20,7 +20,7 @@ def wait(fn,timeout=10):
   time.sleep(.1)
  raise AssertionError('wait timed out')
 def launch(name,*args,env=None):
- f=open(ROOT/'artifacts'/f'telemetry-{name}-{len(processes)}.log','w',encoding='utf8');p=subprocess.Popen([str(ROOT/'target/release'/f'{name}.exe'),*args],cwd=ROOT,stdout=f,stderr=f,env=env);processes.append((p,f));return p
+ f=open(ROOT/'artifacts'/f'telemetry-{name}-{len(processes)}.log','w',encoding='utf8');p=subprocess.Popen([str(ROOT/'target'/os.environ.get('MIC_TEST_PROFILE','release')/f'{name}.exe'),*args],cwd=ROOT,stdout=f,stderr=f,env=env);processes.append((p,f));return p
 
 def history(id='tx-a',range='15m'):return request(f'/telemetry/history?device_id={id}&range={range}')[1]
 def state(id):return next(d['state'] for d in request('/devices')[1] if d['id']==id)
