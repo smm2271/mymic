@@ -1,6 +1,9 @@
 pub mod capture;
+#[cfg(test)]
+mod continuity_regression;
 pub mod declick;
 pub mod diagnostics;
+mod output;
 mod sequence;
 use anyhow::{Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -91,6 +94,8 @@ struct Resampler {
     a: f32,
     b: f32,
     primed: bool,
+    a_faded: bool,
+    b_faded: bool,
 }
 impl Resampler {
     fn new(rate: u32) -> Self {
@@ -100,36 +105,61 @@ impl Resampler {
             a: 0.0,
             b: 0.0,
             primed: false,
+            a_faded: false,
+            b_faded: false,
         }
     }
     fn reset(&mut self) {
         self.primed = false;
         self.phase = 0.0;
     }
+    #[cfg(test)]
     fn next(&mut self, mut input: impl FnMut() -> Option<f32>) -> (f32, bool) {
+        let (value, short, _) = self.next_tagged(|| {
+            input().map(|value| output::Input {
+                value,
+                upstream_faded: false,
+                epoch: 0,
+            })
+        });
+        (value, short)
+    }
+    fn next_tagged(
+        &mut self,
+        mut input: impl FnMut() -> Option<output::Input>,
+    ) -> (f32, bool, bool) {
         let mut short = false;
+        let mut take = || {
+            input().unwrap_or_else(|| {
+                short = true;
+                output::Input {
+                    value: 0.0,
+                    upstream_faded: false,
+                    epoch: 0,
+                }
+            })
+        };
         if !self.primed {
-            self.a = input().unwrap_or_else(|| {
-                short = true;
-                0.0
-            });
-            self.b = input().unwrap_or_else(|| {
-                short = true;
-                0.0
-            });
+            let a = take();
+            let b = take();
+            self.a = a.value;
+            self.a_faded = a.upstream_faded;
+            self.b = b.value;
+            self.b_faded = b.upstream_faded;
             self.primed = true;
         }
         let sample = self.a + (self.b - self.a) * self.phase as f32;
+        let faded = self.a_faded || self.b_faded;
         self.phase += self.step;
         while self.phase >= 1.0 {
             self.phase -= 1.0;
             self.a = self.b;
-            self.b = input().unwrap_or_else(|| {
-                short = true;
-                0.0
-            });
+            self.a_faded = self.b_faded;
+            let b = take();
+            self.b = b.value;
+            self.b_faded = b.upstream_faded;
         }
-        (sample, short)
+        (sample, short, faded)
     }
 }
 #[derive(Default, Clone, Serialize, Debug)]
@@ -166,6 +196,7 @@ pub struct Metrics {
     pub output_sample_rate: u64,
     pub output_channels: u64,
     pub target_buffer_depth: usize,
+    pub contiguous_playable_depth: usize,
     pub underrun_fade_outs: u64,
     pub recovery_fade_ins: u64,
     pub inter_arrival_jitter_ms: f64,
@@ -223,21 +254,36 @@ impl Jitter {
             );
         }
     }
+    /// Occupancy is stored packets; contiguous depth starts exactly at expected.
+    pub fn occupancy(&self) -> usize {
+        self.packets.len()
+    }
+    pub fn expected_sequence(&self) -> Option<u32> {
+        self.expected
+    }
+    pub fn contiguous_playable_depth(&self) -> usize {
+        let Some(expected) = self.expected else {
+            return 0;
+        };
+        (0..self.packets.len())
+            .take_while(|offset| {
+                self.packets
+                    .contains_key(&expected.wrapping_add(*offset as u32))
+            })
+            .count()
+    }
     pub fn push(&mut self, p: AudioPacket) {
         self.metrics.received_packets += 1;
-        if self.seen.contains(&p.sequence) {
+        if self.seen.contains(&p.sequence) || self.packets.contains_key(&p.sequence) {
             self.metrics.duplicate_packets += 1;
             return;
         }
-        self.seen.push_back(p.sequence);
-        if self.seen.len() > 64 {
-            self.seen.pop_front();
-        }
         if let Some(e) = self.expected {
+            let distance = p.sequence.wrapping_sub(e);
             if ahead(e, p.sequence) {
                 self.metrics.out_of_order_packets += 1;
                 if !self.started && e.wrapping_sub(p.sequence) < 8 {
-                    self.expected = Some(p.sequence)
+                    self.expected = Some(p.sequence);
                 } else {
                     self.metrics.late_packet_drops += 1;
                     self.event(
@@ -248,45 +294,59 @@ impl Jitter {
                     );
                     return;
                 }
+            } else if distance > 100 {
+                // Includes ambiguous half-range ordering. Preserve the playable
+                // timeline; an empty-stall reset can establish a new epoch later.
+                self.metrics.jitter_buffer_drops += 1;
+                self.event(
+                    diagnostics::EventType::BufferResync,
+                    Some(p.sequence),
+                    Some(e),
+                    "forward_sequence_rejected",
+                );
+                return;
             } else if p.sequence != e.wrapping_add(self.packets.len() as u32) {
                 self.metrics.out_of_order_packets += 1;
             }
         } else {
-            self.expected = Some(p.sequence)
+            self.expected = Some(p.sequence);
         }
         if self.packets.len() >= 8 {
-            self.event(
-                diagnostics::EventType::BufferResync,
-                Some(p.sequence),
-                self.expected,
-                "jitter_capacity",
-            );
-            self.recovering = true;
+            let expected = self.expected.unwrap();
+            let farthest = *self
+                .packets
+                .keys()
+                .max_by_key(|seq| seq.wrapping_sub(expected))
+                .unwrap();
             self.metrics.buffer_overruns += 1;
-            self.metrics.jitter_buffer_drops += self.packets.len() as u64;
-            self.packets.clear();
-            self.expected = Some(p.sequence);
-            self.started = false;
+            self.metrics.jitter_buffer_drops += 1;
+            if p.sequence.wrapping_sub(expected) < farthest.wrapping_sub(expected) {
+                self.event(
+                    diagnostics::EventType::BufferResync,
+                    Some(p.sequence),
+                    Some(expected),
+                    "jitter_capacity_replace_farthest",
+                );
+                self.packets.remove(&farthest);
+                self.seen.retain(|seq| *seq != farthest);
+            } else {
+                self.event(
+                    diagnostics::EventType::BufferResync,
+                    Some(p.sequence),
+                    Some(expected),
+                    "jitter_capacity_reject_farther",
+                );
+                return;
+            }
         }
-        if self
-            .expected
-            .is_some_and(|e| p.sequence.wrapping_sub(e) > 100 && ahead(p.sequence, e))
-        {
-            self.event(
-                diagnostics::EventType::BufferResync,
-                Some(p.sequence),
-                self.expected,
-                "forward_sequence_jump",
-            );
-            self.recovering = true;
-            self.packets.clear();
-            self.expected = Some(p.sequence);
-            self.started = false;
-            self.metrics.buffer_overruns += 1;
+        self.seen.push_back(p.sequence);
+        if self.seen.len() > 64 {
+            self.seen.pop_front();
         }
         self.metrics.accepted_packets += 1;
         self.packets.insert(p.sequence, p);
         self.metrics.jitter_buffer_depth = self.packets.len();
+        self.metrics.contiguous_playable_depth = self.contiguous_playable_depth();
     }
     pub fn tick(&mut self) -> [i16; 160] {
         if !self.started {
@@ -346,6 +406,7 @@ impl Jitter {
             [0; 160]
         };
         self.metrics.jitter_buffer_depth = self.packets.len();
+        self.metrics.contiguous_playable_depth = self.contiguous_playable_depth();
         output
     }
     pub fn reset(&mut self) {
@@ -356,6 +417,7 @@ impl Jitter {
         self.started = false;
         self.empty_ticks = 0;
         self.metrics.jitter_buffer_depth = 0;
+        self.metrics.contiguous_playable_depth = 0;
     }
 }
 #[derive(Clone, Serialize)]
@@ -370,7 +432,8 @@ struct Select {
 }
 #[derive(Clone)]
 pub struct Playback {
-    queue: Arc<ArrayQueue<f32>>,
+    queue: Arc<ArrayQueue<output::Input>>,
+    epoch: Arc<AtomicU64>,
     active: Arc<AtomicBool>,
     tx: std::sync::mpsc::SyncSender<Select>,
     pub state: Arc<Mutex<String>>,
@@ -409,6 +472,7 @@ impl Playback {
         let capture = capture::Capture::new(diagnostics.clone());
         let p = Self {
             queue: Arc::new(ArrayQueue::new(1600)),
+            epoch: Arc::new(AtomicU64::new(0)),
             active: Arc::new(AtomicBool::new(false)),
             tx,
             state: Arc::new(Mutex::new("stopped".into())),
@@ -470,13 +534,17 @@ impl Playback {
         let _ = self.select("__shutdown");
     }
     pub fn clear(&self) {
-        self.active.store(false, Ordering::Relaxed);
+        self.active.store(false, Ordering::Release);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         while self.queue.pop().is_some() {}
     }
     pub fn set_mute(&self, mute: bool) {
         self.muted.store(mute, Ordering::Relaxed);
     }
     pub fn feed(&self, frame: [i16; 160]) {
+        self.feed_tagged(frame, false);
+    }
+    fn feed_tagged(&self, frame: [i16; 160], upstream_faded: bool) {
         if !self.opened.load(Ordering::Relaxed) {
             return;
         }
@@ -494,12 +562,21 @@ impl Playback {
             self.overruns.fetch_add(1, Ordering::Relaxed);
         }
         self.capture.feed(frame);
+        let epoch = self.epoch.load(Ordering::Acquire);
         for s in frame {
-            if self.queue.push(s as f32 / 32768.0).is_err() {
+            if self
+                .queue
+                .push(output::Input {
+                    value: s as f32 / 32768.0,
+                    upstream_faded,
+                    epoch,
+                })
+                .is_err()
+            {
                 self.overruns.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.active.store(true, Ordering::Relaxed);
+        self.active.store(true, Ordering::Release);
     }
     fn open(&self, id: &str) -> Result<(cpal::Stream, String)> {
         let host = cpal::default_host();
@@ -530,6 +607,7 @@ impl Playback {
         T: cpal::SizedSample + cpal::FromSample<f32>,
     {
         let queue = self.queue.clone();
+        let epoch = self.epoch.clone();
         let active = self.active.clone();
         let underruns = self.underruns.clone();
         let state = self.state.clone();
@@ -544,45 +622,29 @@ impl Playback {
         let error_diagnostics = diagnostics.clone();
         let output_rate = c.sample_rate.0;
         let mut monitor = CallbackMonitor::new(output_rate);
-        let mut sampler = Resampler::new(output_rate);
+        let mut renderer = output::Renderer::new(output_rate);
         Ok(d.build_output_stream(
             c,
             move |data: &mut [T], _| {
                 monitor.begin(
                     Instant::now(),
                     data.len() / channels,
-                    active.load(Ordering::Relaxed) && sampler.primed,
+                    active.load(Ordering::Relaxed) && renderer.primed(),
                     queue.len(),
                     &diagnostics,
                 );
                 output_frames.fetch_add((data.len() / channels) as u64, Ordering::Relaxed);
                 output_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
-                if !active.load(Ordering::Relaxed) || (!sampler.primed && queue.len() < 320) {
-                    data.fill(T::from_sample(0.0));
-                    sampler.reset();
-                    return;
+                let stats = renderer.render(data, channels, &queue, &active, &epoch);
+                input_samples.fetch_add(stats.consumed, Ordering::Relaxed);
+                if stats.rendered {
+                    monitor.finish(stats.short, queue.len(), &diagnostics);
                 }
-                let mut short = false;
-                for frame in data.chunks_mut(channels) {
-                    let (sample, starved) = sampler.next(|| {
-                        let next = queue.pop();
-                        if next.is_some() {
-                            input_samples.fetch_add(1, Ordering::Relaxed);
-                        }
-                        next
-                    });
-                    short |= starved;
-                    for out in frame {
-                        *out = T::from_sample(sample);
-                    }
-                }
-                monitor.finish(short, queue.len(), &diagnostics);
-                if short {
+                if stats.short {
                     starvations.fetch_add(1, Ordering::Relaxed);
                     if !muted.load(Ordering::Relaxed) {
                         underruns.fetch_add(1, Ordering::Relaxed);
                     }
-                    sampler.reset();
                 }
             },
             move |e| {
@@ -687,9 +749,10 @@ impl Engine {
         let was_started = self.jitter.started;
         let f = self.jitter.tick();
         self.update_diagnostic_depth();
+        let upstream_faded = self.jitter.last_tick_missing || self.declicker.in_underrun;
         let smoothed = self.declicker.process(f, self.jitter.last_tick_missing);
         if self.jitter.started || was_started {
-            self.playback.feed(smoothed);
+            self.playback.feed_tagged(smoothed, upstream_faded);
         }
     }
     pub fn reset(&mut self) {
@@ -733,6 +796,7 @@ impl Engine {
         m.output_sample_rate = self.playback.sample_rate.load(Ordering::Relaxed);
         m.output_channels = self.playback.channels.load(Ordering::Relaxed);
         m.target_buffer_depth = self.jitter.depth;
+        m.contiguous_playable_depth = self.jitter.contiguous_playable_depth();
         m.underrun_fade_outs = self.declicker.fade_outs;
         m.recovery_fade_ins = self.declicker.fade_ins;
         m.inter_arrival_jitter_ms = self.inter_arrival_jitter_ms;
@@ -802,15 +866,15 @@ mod tests {
         assert!(
             d.drain()
                 .iter()
-                .any(|r| r.event.reason == "forward_sequence_jump")
+                .any(|r| r.event.reason == "forward_sequence_rejected")
         );
-        for n in 201..210 {
+        for n in 24..34 {
             j.push(packet(n));
         }
         assert!(
             d.drain()
                 .iter()
-                .any(|r| r.event.reason == "jitter_capacity")
+                .any(|r| r.event.reason.starts_with("jitter_capacity_"))
         );
         d.set_enabled(false);
         let mut plain = Jitter::new(2);
