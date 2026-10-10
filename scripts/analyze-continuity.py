@@ -188,14 +188,38 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     records = []
-    for number, line in enumerate(args.jsonl.read_text(encoding='utf8').splitlines(), 1):
+    paths = [args.jsonl]
+    retention = None
+    fault_path = None
+    if args.jsonl.suffix == '.json':
+        manifest = json.loads(args.jsonl.read_text(encoding='utf8'))
+        paths = [Path(part['path']) for part in manifest['detail_parts']]
+        retention = manifest.get('detail_evicted_through_us')
+        fault_path = Path(manifest['fault_archive_path']) if 'fault_archive_path' in manifest else None
+    lines = (line for path in paths for line in path.read_text(encoding='utf8').splitlines())
+    for number, line in enumerate(lines, 1):
         if line.strip():
             try:
                 records.append(json.loads(line))
             except json.JSONDecodeError as e:
                 raise SystemExit(f'invalid/truncated JSONL line {number}: {e}') from e
+    if fault_path and fault_path.exists():
+        # Multiset dedup only the archive copies; retain genuinely repeated events.
+        copies = Counter(json.dumps(r, sort_keys=True) for r in records if r.get('event_type'))
+        for line in fault_path.read_text(encoding='utf8').splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line); key = json.dumps(row, sort_keys=True)
+            if copies[key]:
+                copies[key] -= 1
+            else:
+                records.append(row)
     metadata = json.loads(args.capture.read_text(encoding='utf8')) if args.capture else None
     result = analyze(records, metadata)
+    for row in result:
+        if row.get('record_type') == 'session_summary':
+            row['detail_evicted_through_us'] = retention
+            row['detail_retention_incomplete'] = retention is not None and row['window_start_us'] <= retention
     if not result:
         raise SystemExit('no matching session/window observations; no zero-loss claim can be made')
     args.output.write_text(''.join(json.dumps(r, ensure_ascii=False)+'\n' for r in result), encoding='utf8')

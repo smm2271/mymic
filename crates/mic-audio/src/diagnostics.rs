@@ -3,8 +3,6 @@ use crossbeam_queue::ArrayQueue;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::{File, OpenOptions},
-    io::Write,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -54,6 +52,17 @@ pub struct Observation {
     pub rx_monotonic_us: u64,
     pub stream_id: u64,
     pub packet_sequence: Option<u32>,
+    pub source_sample_index: Option<u32>,
+    pub playout_epoch: u64,
+    pub output_epoch: Option<u64>,
+    pub output_epoch_end: Option<u64>,
+    pub scheduled_us: Option<u64>,
+    pub overdue_us: Option<u64>,
+    pub accepted_samples: Option<u64>,
+    pub dropped_samples: Option<u64>,
+    pub discarded_samples: Option<u64>,
+    pub resampler_phase: Option<f64>,
+    pub resampler_step: Option<f64>,
     pub expected_sequence: Option<u32>,
     pub interval_us: Option<u64>,
     pub sequence_gaps: Option<u64>,
@@ -69,6 +78,7 @@ pub struct Observation {
     pub admitted: Option<bool>,
     pub delivered: Option<bool>,
     pub started: Option<bool>,
+    pub operational: Option<bool>,
     pub requested_frames: Option<u64>,
     /// Device-rate frames with no missing resampler input or inserted output.
     pub supplied_frames: Option<u64>,
@@ -109,6 +119,9 @@ pub struct Snapshot {
     pub recent: Vec<Record>,
     pub event_log_path: Option<String>,
     pub event_log_error: Option<String>,
+    pub drift_manifest_path: Option<String>,
+    pub drift_summary_path: Option<String>,
+    pub drift_telemetry: bool,
 }
 #[derive(Default)]
 struct State {
@@ -116,9 +129,13 @@ struct State {
     buckets: BTreeMap<u64, [u64; 7]>,
     path: Option<String>,
     error: Option<String>,
+    manifest: Option<String>,
+    summary: Option<String>,
 }
 static CLOCK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct Diagnostics {
+    pub(crate) drift_enabled: bool,
+    pub(crate) playout_epoch: AtomicU64,
     origin: Instant,
     clock_id: String,
     pub(crate) queue: ArrayQueue<Event>,
@@ -139,10 +156,12 @@ impl Diagnostics {
         let d = Self::bounded(2048);
         d.set_enabled(std::env::var("MIC_DISABLE_DIAGNOSTICS").as_deref() != Ok("1"));
         let weak = Arc::downgrade(&d);
+        let clock = d.clock_id.clone();
         std::thread::spawn(move || {
-            let mut log: Option<File> = None;
-            let mut bytes = 0usize;
+            let mut sink = crate::drift::Sink::new(diagnostics_dir(), clock);
+            let mut summaries = crate::drift::Summaries::default();
             let mut last_health = 0;
+            let mut last_manifest = 0;
             while let Some(d) = weak.upgrade() {
                 let mut records: Vec<serde_json::Value> = d
                     .drain()
@@ -161,44 +180,39 @@ impl Diagnostics {
                         "enabled": snapshot.enabled, "event_drops": snapshot.drop_count,
                         "enabled_changes": snapshot.enabled_changes,
                         "observation_drops": snapshot.observation_drop_count,
+                        "event_counts": snapshot.counts, "event_types": snapshot.event_types,
                         "log_error": snapshot.event_log_error,
                     }));
                 }
-                for record in records {
-                    let result = (|| -> std::io::Result<()> {
-                        if bytes >= 64 * 1024 * 1024 {
-                            return Err(std::io::Error::other(
-                                "event log reached 64 MiB limit; memory diagnostics continue",
-                            ));
-                        }
-                        if log.is_none() && d.state.lock().unwrap().error.is_none() {
-                            let dir = diagnostics_dir();
-                            std::fs::create_dir_all(&dir)?;
-                            let path = dir.join(format!(
-                                "events-{}-{}.jsonl",
-                                wall_ms(),
-                                std::process::id()
-                            ));
-                            log = Some(
-                                OpenOptions::new()
-                                    .create_new(true)
-                                    .write(true)
-                                    .open(&path)?,
-                            );
-                            d.state.lock().unwrap().path = Some(path.display().to_string());
-                        }
-                        if let Some(file) = &mut log {
-                            let line = serde_json::to_vec(&record)?;
-                            file.write_all(&line)?;
-                            file.write_all(b"\n")?;
-                            bytes += line.len() + 1;
-                        }
-                        Ok(())
-                    })();
-                    if let Err(e) = result {
-                        d.state.lock().unwrap().error = Some(e.to_string());
-                        log = None;
+                for record in &records {
+                    if d.drift_enabled {
+                        summaries.add(record);
                     }
+                    if let Err(e) = sink.detail(record) {
+                        d.state.lock().unwrap().error = Some(e.to_string());
+                    }
+                }
+                if d.drift_enabled {
+                    for summary in
+                        summaries.finish_before(now.saturating_sub(2_000_000) / 1_000_000)
+                    {
+                        if let Err(e) = sink.summary(&summary) {
+                            d.state.lock().unwrap().error = Some(e.to_string());
+                        }
+                    }
+                }
+                if now.saturating_sub(last_manifest) >= 1_000_000 {
+                    sink.checkpoint();
+                    last_manifest = now;
+                }
+                if let Err(e) = sink.manifest() {
+                    d.state.lock().unwrap().error = Some(e.to_string());
+                }
+                {
+                    let mut state = d.state.lock().unwrap();
+                    state.path = sink.current_path();
+                    state.manifest = sink.manifest_path();
+                    state.summary = sink.summary_path();
                 }
                 drop(d);
                 std::thread::sleep(Duration::from_millis(10));
@@ -208,6 +222,8 @@ impl Diagnostics {
     }
     pub(crate) fn bounded(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
+            drift_enabled: std::env::var("MIC_DRIFT_TELEMETRY").as_deref() != Ok("off"),
+            playout_epoch: AtomicU64::new(0),
             origin: Instant::now(),
             clock_id: format!(
                 "rx-{}-{}-{}",
@@ -228,6 +244,9 @@ impl Diagnostics {
             depth: AtomicU64::new(0),
             target: AtomicU64::new(0),
         })
+    }
+    pub fn drift_telemetry_enabled(&self) -> bool {
+        self.drift_enabled
     }
     pub fn now_us(&self) -> u64 {
         self.origin.elapsed().as_micros() as u64
@@ -312,8 +331,13 @@ impl Diagnostics {
             record_type,
             rx_monotonic_us: self.now_us(),
             stream_id: self.stream.load(Ordering::Acquire),
+            playout_epoch: self.playout_epoch.load(Ordering::Relaxed),
             ..Observation::default()
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn discard_observations(&self) {
+        while self.observations.pop().is_some() {}
     }
     pub(crate) fn drain_observations(&self) -> Vec<serde_json::Value> {
         let mut records = Vec::new();
@@ -391,6 +415,9 @@ impl Diagnostics {
             recent: state.recent.iter().cloned().collect(),
             event_log_path: state.path.clone(),
             event_log_error: state.error.clone(),
+            drift_manifest_path: state.manifest.clone(),
+            drift_summary_path: state.summary.clone(),
+            drift_telemetry: self.drift_enabled,
         }
     }
 }

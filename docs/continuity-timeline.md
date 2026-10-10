@@ -1,5 +1,7 @@
 # 音訊連續性時間軸與證據分析
 
+Stage A 已延伸此診斷，新增 source/tick/epoch/feed 觀測、長期摘要與 detail 輪替；目前保存規則及新分析指令見 [drift-stage-a.md](drift-stage-a.md)。下方64 MiB程序停止寫入說明為 `4349c1b` 歷史基準。
+
 ## Phase 0 審查結果
 
 本次檢查 firmware `main.c` / `audio_source.c`、RX network actor 的驗證及 START/STOP/timeout、SequenceTracker、Jitter、Engine、Playback、Renderer/Resampler、Diagnostics/Capture、既有單元／整合測試及 continuity/architecture/protocol/testing 文件。現有事件、clock_id、session_id、stream_id、JSONL writer、capture API 和 WAV sidecar 均延用。

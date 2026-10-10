@@ -91,13 +91,22 @@ try:
     assert metadata['clock_id'] == continuity['clock_id'] and metadata['frames'] == []
     time.sleep(.2)  # let bounded diagnostic worker drain the capture tail
     assert metadata['observation_drop_count_end'] == metadata['observation_drop_count_start'] == 0
-    rows = [json.loads(line) for line in Path(metadata['event_log_path']).read_text().splitlines()]
+    manifest = json.loads(Path(metadata['drift_manifest_path']).read_text())
+    rows = [json.loads(line) for part in manifest['detail_parts'] for line in Path(part['path']).read_text().splitlines()]
     kinds = {r.get('record_type') for r in rows}
     assert {'udp_receive', 'jitter_enqueue', 'jitter_dequeue', 'sequence_status', 'diagnostic_health'} <= kinds
     arrivals = [r for r in rows if r.get('record_type') == 'udp_receive']
     assert all(r['session_id'] == metadata['session_id'] and r['clock_id'] == metadata['clock_id'] for r in arrivals)
     assert any(r['out_of_order'] for r in arrivals)
-    subprocess.run(['python', '-X', 'utf8', str(ROOT / 'scripts/analyze-continuity.py'), metadata['event_log_path'],
+    assert any(r.get('source_sample_index') is not None for r in arrivals)
+    assert any(r.get('record_type') == 'receiver_tick' and r['scheduled_us'] <= r['rx_monotonic_us'] for r in rows)
+    summaries = [json.loads(line) for line in Path(metadata['drift_summary_path']).read_text().splitlines()]
+    assert any(r['counts'].get('udp_receive', 0) > 0 for r in summaries)
+    subprocess.run(['python', '-X', 'utf8', str(ROOT / 'scripts/analyze-drift.py'), metadata['drift_manifest_path'],
+                    '--output', str(ROOT / 'artifacts/drift-stage-a-headless.jsonl')], check=True)
+    estimates = [json.loads(line) for line in (ROOT/'artifacts/drift-stage-a-headless.jsonl').read_text().splitlines()]
+    assert estimates and all(not r['valid'] for r in estimates), 'headless output cannot establish device-relative drift'
+    subprocess.run(['python', '-X', 'utf8', str(ROOT / 'scripts/analyze-continuity.py'), metadata['drift_manifest_path'],
                     '--capture', ended['metadata_path'], '--output', str(ROOT / 'artifacts/diagnostics-analysis.jsonl')], check=True)
     report = [json.loads(line) for line in (ROOT / 'artifacts/diagnostics-analysis.jsonl').read_text(encoding='utf8').splitlines()]
     summary = report[0]

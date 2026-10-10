@@ -106,6 +106,7 @@ pub(crate) struct RenderStats {
     pub missing_input_samples: u64,
     pub short: bool,
     pub consumed: u64,
+    pub stale_discarded: u64,
     pub rendered: bool,
 }
 pub(crate) struct Renderer {
@@ -130,6 +131,12 @@ impl Renderer {
             epoch: 0,
             pending: None,
         }
+    }
+    pub fn phase(&self) -> f64 {
+        self.sampler.phase
+    }
+    pub fn step(&self) -> f64 {
+        self.sampler.step
     }
     pub fn primed(&self) -> bool {
         self.sampler.primed
@@ -204,6 +211,7 @@ impl Renderer {
                             self.pending = Some(input);
                             return None;
                         }
+                        stats.stale_discarded += 1;
                     }
                     None
                 });

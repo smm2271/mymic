@@ -1,5 +1,7 @@
 # Audio continuity diagnostics v0.6.2
 
+Stage A adds bounded detail rotation, independent one-second summaries/fault archives and drift observations; see [drift-stage-a.md](drift-stage-a.md). The historical 64 MiB stop limit below is superseded by that retention scheme.
+
 Current normal-path packet/jitter/callback observations, the 64 MiB log limit, capture correlation and evidence classifier are documented in [continuity timeline](continuity-timeline.md). The inventory below describes the v0.6.2 baseline; current default capacity decisions follow [v0.6.3](audio-continuity-v063.md), rather than clearing all buffered packets.
 
 ## Phase 0: code inventory (before changes)

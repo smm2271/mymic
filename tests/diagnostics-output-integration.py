@@ -66,6 +66,8 @@ try:
     assert callbacks and all(r['session_id'] == metadata['session_id'] for r in callbacks)
     assert all(0 <= r['supplied_frames'] <= r['requested_frames'] for r in callbacks)
     assert any(r['consumed_input_samples'] > 0 for r in callbacks)
+    assert all(r['resampler_step'] == 16000/r['output_rate'] for r in callbacks), 'Stage A must retain fixed ratio'
+    assert all(r['output_epoch'] == r['output_epoch_end'] for r in callbacks)
     assert metadata['observation_drop_count_end'] == metadata['observation_drop_count_start'] == 0
     metrics = request('/metrics')
     assert metrics['input_samples_consumed'] > before and metrics['output_sample_rate'] > 0

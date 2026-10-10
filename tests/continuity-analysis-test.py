@@ -1,6 +1,10 @@
 """Deterministic timeline fixtures; complements tests using actual Jitter/renderer."""
 import importlib.util
 import unittest
+import json
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location('analysis', Path(__file__).resolve().parents[1] / 'scripts/analyze-continuity.py')
@@ -155,6 +159,19 @@ class TimelineTests(unittest.TestCase):
         self.assertEqual(summary['jitter_residence_us']['count'], 1)
         self.assertEqual(summary['jitter_residence_us']['p50'], 200)
         self.assertEqual(summary['jitter_capacity_packets'], [8])
+
+    def test_manifest_archive_dedup_preserves_repeated_events(self):
+        root=Path(__file__).resolve().parents[1]
+        (root/'artifacts').mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=root/'artifacts') as directory:
+            folder=Path(directory); e=event()
+            detail=folder/'detail.jsonl'; detail.write_text(json.dumps(e)+'\n',encoding='utf8')
+            archive=folder/'faults.jsonl'; archive.write_text((json.dumps(e)+'\n')*2,encoding='utf8')
+            manifest=folder/'manifest.json'; manifest.write_text(json.dumps(dict(detail_parts=[dict(path=str(detail))],fault_archive_path=str(archive))),encoding='utf8')
+            output=folder/'report.jsonl'
+            subprocess.run([sys.executable,str(root/'scripts/analyze-continuity.py'),str(manifest),'--output',str(output)],check=True,capture_output=True)
+            rows=[json.loads(line) for line in output.read_text(encoding='utf8').splitlines()]
+            self.assertEqual(sum(r['record_type']=='event_timeline' for r in rows),2)
 
 
 if __name__ == '__main__':

@@ -40,6 +40,8 @@ pub struct Status {
     pub observation_drop_count_end: u64,
     pub event_log_path: Option<String>,
     pub event_log_error: Option<String>,
+    pub drift_manifest_path: Option<String>,
+    pub drift_summary_path: Option<String>,
 }
 #[derive(Clone, Copy)]
 struct Frame {
@@ -226,6 +228,8 @@ impl Capture {
                 observation_drop_count_start: d.observation_drop_count,
                 event_log_path: d.event_log_path,
                 event_log_error: d.event_log_error,
+                drift_manifest_path: d.drift_manifest_path,
+                drift_summary_path: d.drift_summary_path,
                 capture_point: "post_declick_16khz_mono_before_playback_ring_and_device_resampler",
                 ..Status::default()
             };
@@ -311,6 +315,8 @@ impl Capture {
         state.observation_drop_count_end = d.observation_drop_count;
         state.event_log_path = d.event_log_path;
         state.event_log_error = d.event_log_error;
+        state.drift_manifest_path = d.drift_manifest_path;
+        state.drift_summary_path = d.drift_summary_path;
         let metadata = state.clone();
         let result = (|| -> std::io::Result<()> {
             let bytes = serde_json::to_vec_pretty(&Metadata {

@@ -1,8 +1,11 @@
 pub mod capture;
 #[cfg(test)]
+mod clock_drift_tests;
+#[cfg(test)]
 mod continuity_regression;
 pub mod declick;
 pub mod diagnostics;
+mod drift;
 mod output;
 mod sequence;
 use anyhow::{Result, anyhow};
@@ -311,12 +314,26 @@ impl Jitter {
     }
     pub fn push(&mut self, p: AudioPacket) {
         let sequence = p.sequence;
+        let source_timestamp = p.timestamp;
         let before = self.occupancy();
         let accepted = self.metrics.accepted_packets;
+        let cursor_before = self.expected;
+        let started_before = self.started;
         self.push_inner(p);
+        let anchor_changed = (self.expected != cursor_before && (!started_before || !self.started))
+            || (started_before && !self.started);
         if let Some(d) = &self.diagnostics {
+            if anchor_changed {
+                d.playout_epoch.fetch_add(1, Ordering::Relaxed);
+            }
             let mut o = d.observation("jitter_enqueue");
+            if anchor_changed {
+                o.reason = Some("playout_anchor_changed");
+            }
             o.packet_sequence = Some(sequence);
+            if d.drift_enabled {
+                o.source_sample_index = Some(source_timestamp);
+            }
             o.expected_sequence = self.expected;
             o.occupancy = Some(self.occupancy());
             o.occupancy_before = Some(before);
@@ -477,6 +494,7 @@ impl Jitter {
         let expected = self.expected;
         let before = self.occupancy();
         let delivered = self.metrics.delivered_packets;
+        let was_started = self.started;
         let output = self.tick_inner();
         if let Some(d) = &self.diagnostics {
             let mut o = d.observation("jitter_dequeue");
@@ -489,6 +507,7 @@ impl Jitter {
             o.underrun_count = Some(self.metrics.buffer_underruns);
             o.delivered = Some(self.metrics.delivered_packets > delivered);
             o.started = Some(self.started);
+            o.operational = Some(was_started || self.started);
             d.observe(o);
         }
         output
@@ -546,6 +565,9 @@ impl Jitter {
                 // A stalled sender/scheduler must not leave the playout cursor ahead forever.
                 self.started = false;
                 self.expected = None;
+                if let Some(d) = &self.diagnostics {
+                    d.playout_epoch.fetch_add(1, Ordering::Relaxed);
+                }
                 self.empty_ticks = 0;
             }
             [0; 160]
@@ -555,6 +577,9 @@ impl Jitter {
         output
     }
     pub fn reset(&mut self) {
+        if let Some(d) = &self.diagnostics {
+            d.playout_epoch.fetch_add(1, Ordering::Relaxed);
+        }
         self.recovering = false;
         self.packets.clear();
         self.seen.clear();
@@ -688,7 +713,16 @@ impl Playback {
     pub fn clear(&self) {
         self.active.store(false, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::AcqRel);
-        while self.queue.pop().is_some() {}
+        let mut discarded = 0;
+        while self.queue.pop().is_some() {
+            discarded += 1;
+        }
+        if self.diagnostics.drift_enabled {
+            let mut o = self.diagnostics.observation("playback_clear");
+            o.output_epoch = Some(self.epoch.load(Ordering::Acquire));
+            o.discarded_samples = Some(discarded);
+            self.diagnostics.observe(o);
+        }
     }
     pub fn set_mute(&self, mute: bool) {
         self.muted.store(mute, Ordering::Relaxed);
@@ -715,6 +749,7 @@ impl Playback {
         }
         self.capture.feed(frame);
         let epoch = self.epoch.load(Ordering::Acquire);
+        let mut dropped = 0;
         for s in frame {
             if self
                 .queue
@@ -726,12 +761,18 @@ impl Playback {
                 .is_err()
             {
                 self.overruns.fetch_add(1, Ordering::Relaxed);
+                dropped += 1;
             }
         }
         self.active.store(true, Ordering::Release);
         let mut o = self.diagnostics.observation("playback_feed");
         o.ring_after = Some(self.queue.len());
         o.capacity = Some(self.queue.capacity());
+        if self.diagnostics.drift_enabled {
+            o.output_epoch = Some(epoch);
+            o.accepted_samples = Some(160 - dropped);
+            o.dropped_samples = Some(dropped);
+        }
         self.diagnostics.observe(o);
     }
     fn open(&self, id: &str) -> Result<(cpal::Stream, String)> {
@@ -794,6 +835,9 @@ impl Playback {
                     observation.budget_us = None;
                 }
                 observation.ring_before = Some(queue.len());
+                if diagnostics.drift_enabled {
+                    observation.output_epoch = Some(epoch.load(Ordering::Acquire));
+                }
                 let running = active.load(Ordering::Relaxed) && renderer.primed();
                 observation.started = Some(running);
                 counters.callback(diagnostics.now_us(), output_rate);
@@ -817,6 +861,12 @@ impl Playback {
                 observation.consumed_input_samples = Some(stats.consumed);
                 observation.output_rate = Some(output_rate);
                 observation.ring_after = Some(queue.len());
+                if diagnostics.drift_enabled {
+                    observation.output_epoch_end = Some(epoch.load(Ordering::Acquire));
+                    observation.discarded_samples = Some(stats.stale_discarded);
+                    observation.resampler_phase = Some(renderer.phase());
+                    observation.resampler_step = Some(renderer.step());
+                }
                 diagnostics.observe(observation);
                 counters.record(&stats);
                 input_samples.fetch_add(stats.consumed, Ordering::Relaxed);
@@ -924,6 +974,9 @@ impl Engine {
         let mut o = d.observation("udp_receive");
         o.rx_monotonic_us = arrival_us;
         o.packet_sequence = Some(p.sequence);
+        if d.drift_enabled {
+            o.source_sample_index = Some(p.timestamp);
+        }
         o.interval_us = self
             .diagnostic_arrival_us
             .map(|t| arrival_us.saturating_sub(t));

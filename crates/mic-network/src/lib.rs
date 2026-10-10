@@ -271,7 +271,14 @@ async fn run(
                                                      if messages.is_empty(){let _=command.reply.send(Err("empty audio update".into()));continue}
                                                      send(&socket,&messages[0],e.peer).await;e.pending=Some(Pending{messages,position:0,reply:Some(command.reply),sent:Instant::now(),retries:0});
                                                     },
-                                                    deadline=tick.tick()=>{if time::Instant::now().saturating_duration_since(deadline)>Duration::from_millis(20){tick.reset();engine.rebuffer();engine.jitter.metrics.receiver_clock_resets+=1;if let Some(id)=&active && let Some(e)=entries.get(id){telemetry.event_with_context(&e.device.id,Some(e.session.clone()),EventType::BufferResync,None,Some(engine.jitter.metrics.jitter_buffer_depth),Some(engine.jitter.depth));}continue;}
+                                                    deadline=tick.tick()=>{let overdue=time::Instant::now().saturating_duration_since(deadline);
+                if engine.playback.diagnostics.drift_telemetry_enabled() {
+                    let mut o=engine.playback.diagnostics.observation("receiver_tick");
+                    o.overdue_us=Some(overdue.as_micros() as u64);
+                    o.scheduled_us=Some(o.rx_monotonic_us.saturating_sub(overdue.as_micros() as u64));
+                    engine.playback.diagnostics.observe(o);
+                }
+                if overdue>Duration::from_millis(20){tick.reset();engine.rebuffer();engine.jitter.metrics.receiver_clock_resets+=1;if let Some(id)=&active && let Some(e)=entries.get(id){telemetry.event_with_context(&e.device.id,Some(e.session.clone()),EventType::BufferResync,None,Some(engine.jitter.metrics.jitter_buffer_depth),Some(engine.jitter.depth));}continue;}
                 if let Some(e) = active.as_ref().and_then(|id| entries.get_mut(id)) && e.device.state == State::Streaming {
                     let prev_underruns = engine.jitter.metrics.buffer_underruns;
                     let prev_overruns = engine.jitter.metrics.buffer_overruns;
