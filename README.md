@@ -1,4 +1,8 @@
-# Wireless Mic PoC v0.5.2
+# Wireless Mic PoC v0.6.2
+
+## v0.6.2 Audio continuity diagnostics
+
+Dashboard now exposes bounded RX continuity events, per-type cumulative/60-second counts, diagnostic drops and optional 30-second WAV capture. Capture is post-de-click 16 kHz mono PCM before the device resampler; callback starvation/gap/output-error events cover later stages. ESP32 Serial timing reports identify fresh windows and separate generation, queue residence, preparation and send duration. See [diagnostic definitions, test evidence and hardware acceptance](docs/continuity-diagnostics.md). Hardware root cause and audible pop resolution remain unverified.
 
 ## v0.5.2 Windows audio timing
 
