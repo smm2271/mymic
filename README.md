@@ -1,4 +1,8 @@
-# Wireless Mic PoC v0.6.2
+# Wireless Mic PoC v0.6.3
+
+## v0.6.3 Phase 1 continuity fixes
+
+Final CPAL output now smooths starvation/reset/recovery transitions without adding normal-playout delay or doubling upstream de-click gain fades. A full jitter buffer preserves the nearest playable sequence prefix instead of clearing every packet. Targets and UDP wire format remain unchanged. See [behavior, regression evidence and pending hardware A/B](docs/audio-continuity-v063.md). ESP32 listening acceptance remains pending.
 
 ## v0.6.2 Audio continuity diagnostics
 
