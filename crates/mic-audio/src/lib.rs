@@ -1,7 +1,9 @@
+pub mod declick;
 mod sequence;
 use anyhow::{Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
+pub use declick::Declicker;
 use mic_protocol::{AudioPacket, ahead};
 use serde::Serialize;
 use std::{
@@ -87,28 +89,39 @@ pub struct Metrics {
     pub ring_depth_samples: usize,
     pub output_sample_rate: u64,
     pub output_channels: u64,
+    pub target_buffer_depth: usize,
+    pub underrun_fade_outs: u64,
+    pub recovery_fade_ins: u64,
+    pub inter_arrival_jitter_ms: f64,
+    pub inter_arrival_interval_ms: Option<f64>,
 }
 pub struct Jitter {
     packets: HashMap<u32, AudioPacket>,
     expected: Option<u32>,
-    started: bool,
-    depth: usize,
+    pub started: bool,
+    pub depth: usize,
     pub metrics: Metrics,
     seen: std::collections::VecDeque<u32>,
     empty_ticks: u8,
-    muted: bool,
+    pub muted: bool,
+    pub last_tick_missing: bool,
 }
 impl Jitter {
     pub fn new(depth: usize) -> Self {
+        let depth = depth.clamp(2, 4);
         Self {
             packets: HashMap::new(),
             expected: None,
             started: false,
-            depth: depth.clamp(2, 4),
-            metrics: Metrics::default(),
+            depth,
+            metrics: Metrics {
+                target_buffer_depth: depth,
+                ..Metrics::default()
+            },
             seen: std::collections::VecDeque::new(),
             empty_ticks: 0,
             muted: false,
+            last_tick_missing: false,
         }
     }
     pub fn push(&mut self, p: AudioPacket) {
@@ -159,6 +172,7 @@ impl Jitter {
     pub fn tick(&mut self) -> [i16; 160] {
         if !self.started {
             if self.packets.len() < self.depth {
+                self.last_tick_missing = true;
                 return [0; 160];
             };
             self.started = true;
@@ -166,11 +180,13 @@ impl Jitter {
         let e = self.expected.unwrap();
         self.expected = Some(e.wrapping_add(1));
         let output = if let Some(p) = self.packets.remove(&e) {
+            self.last_tick_missing = false;
             self.empty_ticks = 0;
             self.metrics.delivered_packets += 1;
             self.metrics.delivered_samples += 160;
             p.samples
         } else {
+            self.last_tick_missing = true;
             self.metrics.lost_packets += 1;
             if !self.muted {
                 self.metrics.buffer_underruns += 1;
@@ -409,21 +425,54 @@ impl Default for Playback {
 pub struct Engine {
     pub jitter: Jitter,
     pub playback: Playback,
+    pub declicker: Declicker,
     started: Instant,
     bytes: u64,
     sequence: sequence::SequenceTracker,
+    last_arrival: Option<Instant>,
+    inter_arrival_jitter_ms: f64,
+    last_inter_arrival_interval_ms: Option<f64>,
+    last_timestamp: Option<u32>,
 }
 impl Engine {
     pub fn new(depth: usize) -> Self {
         Self {
             jitter: Jitter::new(depth),
             playback: Playback::new(),
+            declicker: Declicker::new(),
             started: Instant::now(),
             bytes: 0,
             sequence: sequence::SequenceTracker::default(),
+            last_arrival: None,
+            inter_arrival_jitter_ms: 0.0,
+            last_inter_arrival_interval_ms: None,
+            last_timestamp: None,
         }
     }
+    pub fn inter_arrival_jitter_ms(&self) -> f64 {
+        self.inter_arrival_jitter_ms
+    }
+    pub fn target_buffer_depth(&self) -> usize {
+        self.jitter.depth
+    }
+    pub fn underrun_fade_outs(&self) -> u64 {
+        self.declicker.fade_outs
+    }
+    pub fn recovery_fade_ins(&self) -> u64 {
+        self.declicker.fade_ins
+    }
     pub fn receive(&mut self, p: AudioPacket) {
+        let now = Instant::now();
+        if let (Some(prev_time), Some(prev_ts)) = (self.last_arrival, self.last_timestamp) {
+            let delta_ms = now.duration_since(prev_time).as_secs_f64() * 1000.0;
+            let nominal_ms = p.timestamp.wrapping_sub(prev_ts) as f64 / 16.0;
+            let d = (delta_ms - nominal_ms).abs();
+            self.inter_arrival_jitter_ms += (d - self.inter_arrival_jitter_ms) / 16.0;
+            self.last_inter_arrival_interval_ms = Some(delta_ms);
+        }
+        self.last_arrival = Some(now);
+        self.last_timestamp = Some(p.timestamp);
+
         self.sequence
             .observe(p.sequence, self.started.elapsed().as_millis() as u64);
         self.bytes += 320;
@@ -436,12 +485,15 @@ impl Engine {
         self.jitter.metrics.sequence_out_of_order = self.sequence.reordered;
         let was_started = self.jitter.started;
         let f = self.jitter.tick();
+        let smoothed = self.declicker.process(f, self.jitter.last_tick_missing);
         if self.jitter.started || was_started {
-            self.playback.feed(f);
+            self.playback.feed(smoothed);
         }
     }
     pub fn reset(&mut self) {
         self.sequence.reset();
+        self.last_arrival = None;
+        self.last_timestamp = None;
         self.rebuffer();
     }
     pub fn set_mute(&mut self, mute: bool) {
@@ -450,7 +502,8 @@ impl Engine {
     }
     pub fn rebuffer(&mut self) {
         self.jitter.reset();
-        self.playback.clear()
+        self.playback.clear();
+        self.declicker.reset();
     }
     pub fn metrics(&self) -> Metrics {
         let mut m = self.jitter.metrics.clone();
@@ -466,6 +519,11 @@ impl Engine {
         m.ring_depth_samples = self.playback.queue.len();
         m.output_sample_rate = self.playback.sample_rate.load(Ordering::Relaxed);
         m.output_channels = self.playback.channels.load(Ordering::Relaxed);
+        m.target_buffer_depth = self.jitter.depth;
+        m.underrun_fade_outs = self.declicker.fade_outs;
+        m.recovery_fade_ins = self.declicker.fade_ins;
+        m.inter_arrival_jitter_ms = self.inter_arrival_jitter_ms;
+        m.inter_arrival_interval_ms = self.last_inter_arrival_interval_ms;
 
         m
     }
@@ -631,6 +689,30 @@ mod stage_tests {
         }
         assert_eq!(engine.metrics().ring_depth_samples, 0);
         assert_eq!(engine.metrics().buffer_overruns, 0);
+        engine.playback.shutdown();
+    }
+    #[test]
+    fn engine_timing_diagnostics_and_continuity_metrics() {
+        let mut engine = Engine::new(2);
+        for n in 0..10 {
+            engine.receive(packet(n));
+            engine.tick();
+        }
+        assert_eq!(engine.target_buffer_depth(), 2);
+        // Inter-arrival jitter is measured across received packets
+        let jitter = engine.inter_arrival_jitter_ms();
+        assert!(jitter >= 0.0);
+
+        // Cause an underrun by ticking until buffer is exhausted
+        engine.tick(); // drains last buffered packet
+        engine.tick(); // missing frame triggers declick fade-out
+        assert!(engine.underrun_fade_outs() > 0);
+
+        // Resume packet stream and tick
+        engine.receive(packet(10));
+        engine.tick();
+        assert!(engine.recovery_fade_ins() > 0);
+
         engine.playback.shutdown();
     }
 }
