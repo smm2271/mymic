@@ -34,30 +34,35 @@ typedef struct
     uint8_t session[16], key[32];
     struct sockaddr_in destination;
     int16_t samples[160];
-    int64_t generated_us;
+    int64_t generated_us, enqueued_us;
 } frame_t;
 typedef struct
 {
-    uint32_t packets;
+    uint32_t packets, interval_count;
     uint32_t send_errors;
     uint32_t late_frames;
     uint32_t queue_drops;
     int64_t min_interval_us;
     int64_t max_interval_us;
     int64_t sum_interval_us;
-    int64_t sum_sq_interval_us;
+    double sum_sq_interval_us;
     int64_t max_queue_delay_us;
     int64_t max_send_duration_us;
+    uint32_t window_id, last_sequence, queue_depth_max;
+    int64_t start_us, end_us, generation_max_us, preparation_max_us;
+    int64_t generated_us, enqueued_us, dequeued_us, send_started_us, completed_us;
 } tx_metrics_window_t;
 typedef struct
 {
-    uint32_t window_packets;
+    uint32_t epoch;
+    uint32_t window_packets, window_successful, window_id, window_queue_depth_max;
+    int64_t window_generation_max_us, window_preparation_max_us;
     uint32_t window_send_errors;
     uint32_t window_late_frames;
     int64_t window_min_interval_us;
     int64_t window_max_interval_us;
     int64_t window_sum_interval_us;
-    int64_t window_sum_sq_interval_us;
+    double window_sum_sq_interval_us;
     int64_t window_max_queue_delay_us;
     int64_t window_max_send_duration_us;
     int64_t last_sendto_completed_us;
@@ -66,12 +71,13 @@ typedef struct
     int has_published;
 } tx_timing_state_t;
 static tx_timing_state_t tx_timing;
+static portMUX_TYPE timing_lock = portMUX_INITIALIZER_UNLOCKED;
 static context_t ctx;
 static SemaphoreHandle_t mutex;
 static QueueHandle_t frames;
 static char device_id[32], code[33];
 static int control_fd, discovery_fd, audio_fd;
-static _Atomic uint32_t requests, drops, packets;
+static _Atomic uint32_t requests, drops, packets, generated_frames, queue_drops;
 static void random_hex(char out[33])
 {
     uint8_t b[16];
@@ -105,7 +111,11 @@ static void reset_connection(void)
     ctx.session[0] = 0;
     random_hex(ctx.nonce);
     xSemaphoreGive(mutex);
+    portENTER_CRITICAL(&timing_lock);
+    uint32_t previous_window_id = tx_timing.window_id;
     memset(&tx_timing, 0, sizeof(tx_timing));
+    tx_timing.window_id = previous_window_id;
+    portEXIT_CRITICAL(&timing_lock);
     xQueueReset(frames);
 }
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -359,12 +369,15 @@ static void generation_task(void *arg)
         memcpy(frame.key, c.key, 32);
         memcpy(frame.session, c.session_bytes, 16);
         audio_source_frame(&source, c.gain, c.mute, frame.samples);
+        generated_frames++;
+        frame.enqueued_us = esp_timer_get_time();
         if (xQueueSend(frames, &frame, 0) != pdTRUE)
         {
             frame_t dropped;
             xQueueReceive(frames, &dropped, 0);
             xQueueSend(frames, &frame, 0);
             drops++;
+            queue_drops++;
         }
     }
 }
@@ -376,20 +389,42 @@ static void transport_task(void *arg)
     {
         if (xQueueReceive(frames, &frame, portMAX_DELAY) != pdTRUE)
             continue;
+        int64_t dequeued_us = esp_timer_get_time();
+        uint32_t queue_depth = (uint32_t)uxQueueMessagesWaiting(frames) + 1;
         context_t c = snapshot();
         if (!c.streaming || !c.paired || frame.epoch != c.epoch)
             continue;
         int64_t entry_time_us = esp_timer_get_time();
-        int64_t queue_delay_us = entry_time_us - frame.generated_us;
+        int64_t queue_delay_us = dequeued_us - frame.enqueued_us;
         mic_encode_body(packet, frame.sequence, frame.timestamp, frame.session, frame.samples);
         mic_hmac(frame.key, 32, packet, 352, digest);
         memcpy(packet + 352, digest, 16);
+        int64_t send_started_us = esp_timer_get_time();
         int res = sendto(audio_fd, packet, sizeof packet, 0, (struct sockaddr *)&frame.destination, sizeof frame.destination);
         int64_t completed_time_us = esp_timer_get_time();
-        int64_t send_duration_us = completed_time_us - entry_time_us;
-        if (res >= 0)
+        int64_t send_duration_us = completed_time_us - send_started_us;
+        portENTER_CRITICAL(&timing_lock);
+        if (tx_timing.epoch != frame.epoch) {
+            uint32_t previous_window_id = tx_timing.window_id;
+            memset(&tx_timing, 0, sizeof(tx_timing));
+            tx_timing.window_id = previous_window_id;
+            tx_timing.epoch = frame.epoch;
+        }
+        if (tx_timing.window_start_us == 0) {
+            tx_timing.window_start_us = entry_time_us;
+            tx_timing.window_min_interval_us = INT64_MAX;
+        }
+        if (queue_delay_us > tx_timing.window_max_queue_delay_us) tx_timing.window_max_queue_delay_us = queue_delay_us;
+        if (send_duration_us > tx_timing.window_max_send_duration_us) tx_timing.window_max_send_duration_us = send_duration_us;
+        int64_t generation_us = frame.enqueued_us - frame.generated_us;
+        int64_t preparation_us = send_started_us - entry_time_us;
+        if (generation_us > tx_timing.window_generation_max_us) tx_timing.window_generation_max_us = generation_us;
+        if (preparation_us > tx_timing.window_preparation_max_us) tx_timing.window_preparation_max_us = preparation_us;
+        if (queue_depth > tx_timing.window_queue_depth_max) tx_timing.window_queue_depth_max = queue_depth;
+        if (res == sizeof packet)
         {
             packets++;
+            tx_timing.window_successful++;
             if (tx_timing.last_sendto_completed_us > 0)
             {
                 int64_t interval_us = completed_time_us - tx_timing.last_sendto_completed_us;
@@ -401,19 +436,11 @@ static void transport_task(void *arg)
                     if (interval_us > tx_timing.window_max_interval_us)
                         tx_timing.window_max_interval_us = interval_us;
                     tx_timing.window_sum_interval_us += interval_us;
-                    tx_timing.window_sum_sq_interval_us += interval_us * interval_us;
+                    tx_timing.window_sum_sq_interval_us += (double)interval_us * interval_us;
                     if (interval_us > 15000)
                         tx_timing.window_late_frames++;
-                    if (queue_delay_us > tx_timing.window_max_queue_delay_us)
-                        tx_timing.window_max_queue_delay_us = queue_delay_us;
-                    if (send_duration_us > tx_timing.window_max_send_duration_us)
-                        tx_timing.window_max_send_duration_us = send_duration_us;
+
                 }
-            }
-            else
-            {
-                tx_timing.window_min_interval_us = INT64_MAX;
-                tx_timing.window_start_us = completed_time_us;
             }
             tx_timing.last_sendto_completed_us = completed_time_us;
         }
@@ -422,13 +449,20 @@ static void transport_task(void *arg)
             drops++;
             tx_timing.window_send_errors++;
         }
-        if (completed_time_us - tx_timing.window_start_us >= 1000000 && tx_timing.window_packets > 0)
+        if (completed_time_us - tx_timing.window_start_us >= 1000000)
         {
             tx_timing.published = (tx_metrics_window_t){
-                .packets = tx_timing.window_packets,
+                .packets = tx_timing.window_successful,
+                .interval_count = tx_timing.window_packets,
+                .window_id = ++tx_timing.window_id,
+                .start_us = tx_timing.window_start_us, .end_us = completed_time_us,
+                .generation_max_us = tx_timing.window_generation_max_us, .preparation_max_us = tx_timing.window_preparation_max_us,
+                .queue_depth_max = tx_timing.window_queue_depth_max, .last_sequence = frame.sequence,
+                .generated_us = frame.generated_us, .enqueued_us = frame.enqueued_us, .dequeued_us = dequeued_us,
+                .send_started_us = send_started_us, .completed_us = completed_time_us,
                 .send_errors = tx_timing.window_send_errors,
                 .late_frames = tx_timing.window_late_frames,
-                .queue_drops = atomic_load(&drops),
+                .queue_drops = atomic_load(&queue_drops),
                 .min_interval_us = tx_timing.window_min_interval_us,
                 .max_interval_us = tx_timing.window_max_interval_us,
                 .sum_interval_us = tx_timing.window_sum_interval_us,
@@ -438,6 +472,9 @@ static void transport_task(void *arg)
             };
             tx_timing.has_published = 1;
             tx_timing.window_packets = 0;
+            tx_timing.window_successful = 0;
+            tx_timing.window_generation_max_us = tx_timing.window_preparation_max_us = 0;
+            tx_timing.window_queue_depth_max = 0;
             tx_timing.window_send_errors = 0;
             tx_timing.window_late_frames = 0;
             tx_timing.window_min_interval_us = INT64_MAX;
@@ -448,6 +485,7 @@ static void transport_task(void *arg)
             tx_timing.window_max_send_duration_us = 0;
             tx_timing.window_start_us = completed_time_us;
         }
+        portEXIT_CRITICAL(&timing_lock);
     }
 }
 static void telemetry_task(void *arg)
@@ -469,19 +507,23 @@ static void telemetry_task(void *arg)
                 send_json(m, &c.peer);
             }
         }
-        if (tx_timing.has_published)
+        portENTER_CRITICAL(&timing_lock);
+        int fresh = tx_timing.has_published;
+        tx_metrics_window_t snap = tx_timing.published;
+        tx_timing.has_published = 0;
+        portEXIT_CRITICAL(&timing_lock);
+        if (fresh)
         {
-            tx_metrics_window_t snap = tx_timing.published;
-            int64_t mean_us = snap.packets > 0 ? (snap.sum_interval_us / snap.packets) : 0;
+            int64_t mean_us = snap.interval_count > 0 ? (snap.sum_interval_us / snap.interval_count) : 0;
             int64_t std_us = 0;
-            if (snap.packets > 1)
+            if (snap.interval_count > 1)
             {
-                double mean = (double)snap.sum_interval_us / snap.packets;
-                double variance = ((double)snap.sum_sq_interval_us - (double)snap.sum_interval_us * mean) / (snap.packets - 1);
+                double mean = (double)snap.sum_interval_us / snap.interval_count;
+                double variance = ((double)snap.sum_sq_interval_us - (double)snap.sum_interval_us * mean) / (snap.interval_count - 1);
                 if (variance > 0)
                     std_us = (int64_t)sqrt(variance);
             }
-            ESP_LOGI(TAG, "TX Timing [1s]: %u packets/s, interval mean=%lld us (min=%lld, max=%lld, std=%lld us), late=%u, err=%u, q_delay_max=%lld us, send_max=%lld us",
+            ESP_LOGI(TAG, "TX Timing window: %u sent, interval mean=%lld us (min=%lld, max=%lld, std=%lld us), late=%u, err=%u, q_delay_max=%lld us, send_max=%lld us",
                      (unsigned)snap.packets,
                      (long long)mean_us,
                      (long long)(snap.min_interval_us == INT64_MAX ? 0 : snap.min_interval_us),
@@ -491,10 +533,18 @@ static void telemetry_task(void *arg)
                      (unsigned)snap.send_errors,
                      (long long)snap.max_queue_delay_us,
                      (long long)snap.max_send_duration_us);
+            ESP_LOGI(TAG, "TX Window id=%u start_us=%lld end_us=%lld duration_us=%lld rate=%.2f intervals=%u gen_total_at_report=%u queue_drops_total=%u queue_depth_max=%u gen_max_us=%lld prep_max_us=%lld",
+                     (unsigned)snap.window_id, (long long)snap.start_us, (long long)snap.end_us, (long long)(snap.end_us-snap.start_us),
+                     (double)snap.packets * 1000000.0 / (snap.end_us-snap.start_us), (unsigned)snap.interval_count,
+                     (unsigned)atomic_load(&generated_frames), (unsigned)snap.queue_drops, (unsigned)snap.queue_depth_max,
+                     (long long)snap.generation_max_us, (long long)snap.preparation_max_us);
+            ESP_LOGI(TAG, "TX Frame seq=%u generated_us=%lld enqueue_attempt_us=%lld dequeued_us=%lld send_started_us=%lld completed_us=%lld report_age_us=%lld",
+                     (unsigned)snap.last_sequence, (long long)snap.generated_us, (long long)snap.enqueued_us, (long long)snap.dequeued_us,
+                     (long long)snap.send_started_us, (long long)snap.completed_us, (long long)(esp_timer_get_time()-snap.end_us));
         }
         else
         {
-            ESP_LOGD(TAG, "packets=%u drops=%u queue=%u", (unsigned)packets, (unsigned)drops, (unsigned)uxQueueMessagesWaiting(frames));
+            ESP_LOGI(TAG, "TX Timing: no fresh window, streaming=%d age_us=%lld queue_now=%u", c.streaming, (long long)(snap.end_us ? esp_timer_get_time() - snap.end_us : -1), (unsigned)uxQueueMessagesWaiting(frames));
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
