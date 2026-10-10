@@ -42,6 +42,7 @@ fn core_error(error: String) -> ApiError {
     } else if error.contains("in progress")
         || error.contains("not connected")
         || error.contains("another device")
+        || error.contains("already active")
     {
         StatusCode::CONFLICT
     } else {
@@ -238,10 +239,11 @@ struct DiagnosticsOptions {
 }
 async fn diagnostics_options(
     State(a): State<App>,
-    Json(b): Json<DiagnosticsOptions>,
-) -> Json<Value> {
+    body: Result<Json<DiagnosticsOptions>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult {
+    let Json(b) = body.map_err(bad)?;
     a.core.playback.diagnostics.set_enabled(b.enabled);
-    Json(json!({"ok":true}))
+    Ok(Json(json!({"ok":true})))
 }
 async fn capture_start(State(a): State<App>) -> ApiResult {
     let capture = a.core.playback.capture.clone();

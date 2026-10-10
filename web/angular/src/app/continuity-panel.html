@@ -15,6 +15,6 @@
 @if(data.capture.error){<p class="warning" role="alert">{{data.capture.error}}</p>}
 <p>擷取 de-click 後、播放佇列與裝置重取樣前的 PCM S16LE / Mono / 16 kHz；不是 Windows loopback。Callback 補零與装置端異常需搭配事件分析。depth 以封包計，ring 以 16 kHz sample 計。</p>
 <details open><summary>最近事件（最多顯示 20 筆）</summary><ul>
-@for(record of data.continuity.recent.slice(-20);track $index){<li><time>RX {{record.rx_monotonic_us}} µs</time> · {{record.event_type}} · {{record.device_id||'未設定裝置'}} / stream {{record.stream_id}} · seq {{record.packet_sequence??'—'}} / expected {{record.expected_sequence??'—'}} · depth {{record.jitter_buffer_depth}} / {{record.target_buffer_depth}} · ring {{record.ring_depth_samples}} · {{record.reason}} @if(record.callback_interval_us!=null){ · Callback gap {{record.callback_interval_us}} µs / budget {{record.callback_budget_us}} µs }</li>}
+@for(record of data.continuity.recent.slice(-20);track $index){<li><time>RX {{record.rx_monotonic_us}} µs</time> · {{record.event_type}} · {{record.device_id||'未設定裝置'}} / stream {{record.stream_id}} · seq {{record.packet_sequence??'—'}} / expected {{record.expected_sequence??'—'}} · depth {{record.jitter_buffer_depth}} / {{record.target_buffer_depth}} · ring {{record.ring_depth_samples??'n/a'}} · {{record.reason}} @if(record.callback_interval_us!=null){ · Callback gap {{record.callback_interval_us}} µs / budget {{record.callback_budget_us}} µs }</li>}
 </ul></details>
 </section>

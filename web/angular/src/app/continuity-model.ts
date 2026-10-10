@@ -1,7 +1,7 @@
 export interface ContinuityRecord {
   event_type:string;rx_monotonic_us:number;stream_id:number;device_id:string|null;
   session_id:string|null;packet_sequence:number|null;expected_sequence:number|null;
-  jitter_buffer_depth:number;target_buffer_depth:number;ring_depth_samples:number;reason:string;callback_interval_us:number|null;callback_budget_us:number|null;
+  jitter_buffer_depth:number;target_buffer_depth:number;ring_depth_samples:number|null;reason:string;callback_interval_us:number|null;callback_budget_us:number|null;
 }
 export interface DiagnosticsSnapshot {
   continuity:{enabled:boolean;drop_count:number;counts:number[];counts_60s:number[];

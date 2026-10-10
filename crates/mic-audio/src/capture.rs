@@ -37,6 +37,7 @@ pub struct Status {
     pub event_drop_count_start: u64,
     pub event_drop_count_end: u64,
     pub event_log_path: Option<String>,
+    pub event_log_error: Option<String>,
 }
 #[derive(Clone, Copy)]
 struct Frame {
@@ -105,7 +106,8 @@ impl Capture {
                         Command::Stop(reply) => {
                             c.active.store(0, Ordering::Release);
                             c.consume(&mut recording);
-                            c.finish(&mut recording, "manual_stop");
+                            let reason = c.finish_reason(&recording).unwrap_or("manual_stop");
+                            c.finish(&mut recording, reason);
                             let _ = reply.send(Ok(c.status()));
                         }
                     }
@@ -220,6 +222,7 @@ impl Capture {
                 session_id: d.current_session_id,
                 event_drop_count_start: d.drop_count,
                 event_log_path: d.event_log_path,
+                event_log_error: d.event_log_error,
                 capture_point: "post_declick_16khz_mono_before_playback_ring_and_device_resampler",
                 ..Status::default()
             };
@@ -291,7 +294,7 @@ impl Capture {
         };
         self.active.store(0, Ordering::Release);
         let finish_result = r.writer.finish();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.status();
         if let Err(e) = finish_result {
             state.error = Some(e.to_string());
         }
@@ -303,8 +306,8 @@ impl Capture {
         let d = self.diagnostics.snapshot();
         state.event_drop_count_end = d.drop_count;
         state.event_log_path = d.event_log_path;
+        state.event_log_error = d.event_log_error;
         let metadata = state.clone();
-        drop(state);
         let result = (|| -> std::io::Result<()> {
             let bytes = serde_json::to_vec_pretty(&Metadata {
                 status: &metadata,
@@ -314,8 +317,9 @@ impl Capture {
             f.write_all(&bytes)
         })();
         if let Err(e) = result {
-            self.state.lock().unwrap().error = Some(format!("metadata: {e}"));
+            state.error = Some(format!("metadata: {e}"));
         }
+        *self.state.lock().unwrap() = state;
     }
 }
 struct Wav {

@@ -42,7 +42,7 @@ pub struct Event {
     pub expected_sequence: Option<u32>,
     pub jitter_buffer_depth: usize,
     pub target_buffer_depth: usize,
-    pub ring_depth_samples: usize,
+    pub ring_depth_samples: Option<usize>,
     pub reason: &'static str,
     pub callback_interval_us: Option<u64>,
     pub callback_budget_us: Option<u64>,
@@ -95,6 +95,7 @@ pub struct Diagnostics {
 impl Diagnostics {
     pub fn new() -> Arc<Self> {
         let d = Self::bounded(2048);
+        d.set_enabled(std::env::var("MIC_DISABLE_DIAGNOSTICS").as_deref() != Ok("1"));
         let weak = Arc::downgrade(&d);
         std::thread::spawn(move || {
             let mut log: Option<File> = None;
@@ -186,7 +187,7 @@ impl Diagnostics {
         expected: Option<u32>,
         depth: usize,
         target: usize,
-        ring: usize,
+        ring: Option<usize>,
         reason: &'static str,
     ) {
         if !self.enabled.load(Ordering::Relaxed) {
@@ -223,7 +224,7 @@ impl Diagnostics {
             expected_sequence: None,
             jitter_buffer_depth: self.depth.load(Ordering::Relaxed) as usize,
             target_buffer_depth: self.target.load(Ordering::Relaxed) as usize,
-            ring_depth_samples: ring,
+            ring_depth_samples: Some(ring),
             reason: "callback_entry_gap_over_previous_buffer_duration_plus_20ms",
             callback_interval_us: Some(interval_us),
             callback_budget_us: Some(budget_us),
@@ -318,7 +319,7 @@ mod tests {
         let d = Diagnostics::bounded(1);
         d.set_context("device", "session");
         for _ in 0..3 {
-            d.emit(EventType::LatePacket, Some(3), Some(4), 2, 3, 0, "test");
+            d.emit(EventType::LatePacket, Some(3), Some(4), 2, 3, None, "test");
         }
         d.drain();
         let s = d.snapshot();
@@ -327,7 +328,7 @@ mod tests {
         assert_eq!(s.counts_60s[1], 1);
         assert_eq!(s.recent[0].device_id.as_deref(), Some("device"));
         d.set_enabled(false);
-        d.emit(EventType::LatePacket, None, None, 0, 3, 0, "disabled");
+        d.emit(EventType::LatePacket, None, None, 0, 3, None, "disabled");
         assert_eq!(d.snapshot().counts[1], 3);
     }
 }

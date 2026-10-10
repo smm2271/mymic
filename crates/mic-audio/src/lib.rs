@@ -6,6 +6,74 @@ use anyhow::{Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
 pub use declick::Declicker;
+/// Observes callback entry gaps and input starvation, not acoustic delivery.
+struct CallbackMonitor {
+    rate: u32,
+    stream: u64,
+    previous: Option<(Instant, u64)>,
+    recovering: bool,
+}
+impl CallbackMonitor {
+    fn new(rate: u32) -> Self {
+        Self {
+            rate,
+            stream: 0,
+            previous: None,
+            recovering: false,
+        }
+    }
+    fn begin(
+        &mut self,
+        now: Instant,
+        frames: usize,
+        running: bool,
+        ring: usize,
+        d: &diagnostics::Diagnostics,
+    ) {
+        let stream = d.stream.load(Ordering::Acquire);
+        if stream != self.stream {
+            self.stream = stream;
+            self.previous = None;
+            self.recovering = false;
+        }
+        if let Some((previous, budget)) = self.previous
+            && running
+        {
+            let gap = now.saturating_duration_since(previous).as_micros() as u64;
+            if gap > budget + 20_000 {
+                d.callback_delay(gap, budget, ring);
+            }
+        }
+        self.previous = Some((now, frames as u64 * 1_000_000 / self.rate as u64));
+    }
+    fn finish(&mut self, short: bool, ring: usize, d: &diagnostics::Diagnostics) {
+        let event = if short {
+            Some((
+                diagnostics::EventType::AudioCallbackStarvation,
+                "resampler_input_empty",
+            ))
+        } else if self.recovering {
+            Some((
+                diagnostics::EventType::AudioRecovery,
+                "callback_consumption_resumed",
+            ))
+        } else {
+            None
+        };
+        if let Some((kind, reason)) = event {
+            d.emit(
+                kind,
+                None,
+                None,
+                d.depth.load(Ordering::Relaxed) as usize,
+                d.target.load(Ordering::Relaxed) as usize,
+                Some(ring),
+                reason,
+            );
+        }
+        self.recovering = short;
+    }
+}
 use mic_protocol::{AudioPacket, ahead};
 use serde::Serialize;
 use std::{
@@ -150,7 +218,7 @@ impl Jitter {
                 expected,
                 self.packets.len(),
                 self.depth,
-                0,
+                None,
                 reason,
             );
         }
@@ -419,7 +487,7 @@ impl Playback {
                 None,
                 self.diagnostics.depth.load(Ordering::Relaxed) as usize,
                 self.diagnostics.target.load(Ordering::Relaxed) as usize,
-                self.queue.len(),
+                Some(self.queue.len()),
                 "playback_ring_backlog_clear",
             );
             self.clear();
@@ -472,29 +540,21 @@ impl Playback {
         let starvations = self.callback_starvations.clone();
         let muted = self.muted.clone();
         let diagnostics = self.diagnostics.clone();
-        let mut recovering = false;
 
         let error_diagnostics = diagnostics.clone();
         let output_rate = c.sample_rate.0;
-        let mut previous_callback: Option<(Instant, u64)> = None;
+        let mut monitor = CallbackMonitor::new(output_rate);
         let mut sampler = Resampler::new(output_rate);
         Ok(d.build_output_stream(
             c,
             move |data: &mut [T], _| {
-                let now = Instant::now();
-                if let Some((previous, budget)) = previous_callback
-                    && active.load(Ordering::Relaxed)
-                    && sampler.primed
-                {
-                    let gap = now.duration_since(previous).as_micros() as u64;
-                    if gap > budget + 20_000 {
-                        diagnostics.callback_delay(gap, budget, queue.len());
-                    }
-                }
-                previous_callback = Some((
-                    now,
-                    (data.len() / channels) as u64 * 1_000_000 / output_rate as u64,
-                ));
+                monitor.begin(
+                    Instant::now(),
+                    data.len() / channels,
+                    active.load(Ordering::Relaxed) && sampler.primed,
+                    queue.len(),
+                    &diagnostics,
+                );
                 output_frames.fetch_add((data.len() / channels) as u64, Ordering::Relaxed);
                 output_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
                 if !active.load(Ordering::Relaxed) || (!sampler.primed && queue.len() < 320) {
@@ -516,33 +576,13 @@ impl Playback {
                         *out = T::from_sample(sample);
                     }
                 }
+                monitor.finish(short, queue.len(), &diagnostics);
                 if short {
-                    diagnostics.emit(
-                        diagnostics::EventType::AudioCallbackStarvation,
-                        None,
-                        None,
-                        diagnostics.depth.load(Ordering::Relaxed) as usize,
-                        diagnostics.target.load(Ordering::Relaxed) as usize,
-                        queue.len(),
-                        "resampler_input_empty",
-                    );
-                    recovering = true;
                     starvations.fetch_add(1, Ordering::Relaxed);
                     if !muted.load(Ordering::Relaxed) {
                         underruns.fetch_add(1, Ordering::Relaxed);
                     }
                     sampler.reset();
-                } else if recovering {
-                    diagnostics.emit(
-                        diagnostics::EventType::AudioRecovery,
-                        None,
-                        None,
-                        diagnostics.depth.load(Ordering::Relaxed) as usize,
-                        diagnostics.target.load(Ordering::Relaxed) as usize,
-                        queue.len(),
-                        "callback_consumption_resumed",
-                    );
-                    recovering = false;
                 }
             },
             move |e| {
@@ -552,7 +592,7 @@ impl Playback {
                     None,
                     error_diagnostics.depth.load(Ordering::Relaxed) as usize,
                     error_diagnostics.target.load(Ordering::Relaxed) as usize,
-                    0,
+                    None,
                     "cpal_output_error_see_output_state",
                 );
                 *state.lock().unwrap() = format!("error: {e}");
@@ -612,7 +652,7 @@ impl Engine {
         let now = Instant::now();
         if let (Some(prev_time), Some(prev_ts)) = (self.last_arrival, self.last_timestamp) {
             let delta_ms = now.duration_since(prev_time).as_secs_f64() * 1000.0;
-            let nominal_ms = p.timestamp.wrapping_sub(prev_ts) as f64 / 16.0;
+            let nominal_ms = p.timestamp.wrapping_sub(prev_ts) as i32 as f64 / 16.0;
             let d = (delta_ms - nominal_ms).abs();
             self.inter_arrival_jitter_ms += (d - self.inter_arrival_jitter_ms) / 16.0;
             self.last_inter_arrival_interval_ms = Some(delta_ms);
@@ -852,6 +892,50 @@ mod recovery_tests {
 mod resampling_tests {
     use super::*;
     #[test]
+    fn callback_monitor_normal_gap_starvation_and_recovery() {
+        let d = diagnostics::Diagnostics::bounded(16);
+        let mut monitor = CallbackMonitor::new(48000);
+        let now = Instant::now();
+        monitor.begin(now, 480, false, 320, &d);
+        monitor.finish(false, 160, &d);
+        monitor.begin(now + Duration::from_millis(10), 480, true, 160, &d);
+        monitor.finish(false, 0, &d);
+        assert!(d.queue.is_empty());
+        monitor.begin(now + Duration::from_millis(100), 480, true, 0, &d);
+        monitor.finish(true, 0, &d);
+        monitor.begin(now + Duration::from_millis(110), 480, false, 0, &d);
+        // Inactive/rebuffering silence does not imply consumption recovery.
+        monitor.begin(now + Duration::from_millis(500), 480, false, 320, &d);
+        monitor.finish(false, 160, &d);
+        let events = d.drain();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0].event.event_type,
+            diagnostics::EventType::AudioCallbackDelay
+        );
+        assert_eq!(events[0].event.callback_interval_us, Some(90000));
+        assert_eq!(events[0].event.callback_budget_us, Some(10000));
+        assert_eq!(
+            events[1].event.event_type,
+            diagnostics::EventType::AudioCallbackStarvation
+        );
+        assert_eq!(events[2].event.reason, "callback_consumption_resumed");
+        monitor.finish(true, 0, &d);
+        d.drain();
+        d.set_context("new-tx", "new-session");
+        monitor.begin(now + Duration::from_secs(3), 480, true, 320, &d);
+        monitor.finish(false, 160, &d);
+        assert!(
+            d.queue.is_empty(),
+            "stream restart is not callback recovery or a callback gap"
+        );
+        let mut sampler = Resampler::new(48000);
+        assert!(
+            sampler.next(|| None).1,
+            "initial priming misses must be observed"
+        );
+    }
+    #[test]
     fn sixteen_to_forty_eight_khz_preserves_440hz_and_duration() {
         let source: Vec<f32> = (0..16000)
             .map(|n| (std::f32::consts::TAU * 440.0 * n as f32 / 16000.0).sin())
@@ -959,6 +1043,24 @@ mod stage_tests {
         engine.tick();
         assert!(engine.recovery_fade_ins() > 0);
 
+        engine.playback.shutdown();
+    }
+    #[test]
+    fn reordered_timestamps_do_not_create_unsigned_jitter_spikes() {
+        let mut engine = Engine::new(2);
+        for n in [0, 2, 1, 3] {
+            engine.receive(packet(n));
+        }
+        // A backward 160-sample timestamp is -10 ms, not a 2^32-sample jump.
+        assert!(engine.inter_arrival_jitter_ms() < 1000.0);
+        engine.reset();
+        for n in [u32::MAX / 160, (u32::MAX / 160) + 1] {
+            let mut p = packet(0);
+            p.sequence = n;
+            p.timestamp = n.wrapping_mul(160);
+            engine.receive(p);
+        }
+        assert!(engine.inter_arrival_jitter_ms() < 1000.0);
         engine.playback.shutdown();
     }
 }
