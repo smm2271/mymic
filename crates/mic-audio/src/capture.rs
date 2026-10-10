@@ -36,6 +36,8 @@ pub struct Status {
     pub last_frame_monotonic_us: Option<u64>,
     pub event_drop_count_start: u64,
     pub event_drop_count_end: u64,
+    pub observation_drop_count_start: u64,
+    pub observation_drop_count_end: u64,
     pub event_log_path: Option<String>,
     pub event_log_error: Option<String>,
 }
@@ -221,6 +223,7 @@ impl Capture {
                 device_id: d.current_device_id,
                 session_id: d.current_session_id,
                 event_drop_count_start: d.drop_count,
+                observation_drop_count_start: d.observation_drop_count,
                 event_log_path: d.event_log_path,
                 event_log_error: d.event_log_error,
                 capture_point: "post_declick_16khz_mono_before_playback_ring_and_device_resampler",
@@ -305,6 +308,7 @@ impl Capture {
         state.reason = Some(reason.into());
         let d = self.diagnostics.snapshot();
         state.event_drop_count_end = d.drop_count;
+        state.observation_drop_count_end = d.observation_drop_count;
         state.event_log_path = d.event_log_path;
         state.event_log_error = d.event_log_error;
         let metadata = state.clone();

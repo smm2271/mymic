@@ -96,6 +96,7 @@ fn smoothstep(position: u32, length: u32) -> f32 {
 #[derive(Default)]
 pub(crate) struct RenderStats {
     pub zero_frames: u64,
+    pub supplied_frames: u64,
     pub inserted_frames: u64,
     pub prefill_frames: u64,
     pub inactive_frames: u64,
@@ -217,6 +218,7 @@ impl Renderer {
                         Some((value, faded))
                     }
                 } else {
+                    stats.supplied_frames += 1;
                     Some((value, faded))
                 }
             } else {

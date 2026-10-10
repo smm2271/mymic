@@ -47,6 +47,43 @@ pub struct Event {
     pub callback_interval_us: Option<u64>,
     pub callback_budget_us: Option<u64>,
 }
+/// Fixed-size observations; serialization and context resolution happen in the worker.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct Observation {
+    pub record_type: &'static str,
+    pub rx_monotonic_us: u64,
+    pub stream_id: u64,
+    pub packet_sequence: Option<u32>,
+    pub expected_sequence: Option<u32>,
+    pub interval_us: Option<u64>,
+    pub sequence_gaps: Option<u64>,
+    pub pending_sequence_holes: Option<u64>,
+    pub out_of_order: Option<bool>,
+    pub duplicate: Option<bool>,
+    pub occupancy: Option<usize>,
+    pub occupancy_before: Option<usize>,
+    pub contiguous_depth: Option<usize>,
+    pub capacity: Option<usize>,
+    pub late_packet_count: Option<u64>,
+    pub underrun_count: Option<u64>,
+    pub admitted: Option<bool>,
+    pub delivered: Option<bool>,
+    pub started: Option<bool>,
+    pub requested_frames: Option<u64>,
+    /// Device-rate frames with no missing resampler input or inserted output.
+    pub supplied_frames: Option<u64>,
+    pub inserted_frames: Option<u64>,
+    pub starvation_frames: Option<u64>,
+    pub prefill_frames: Option<u64>,
+    pub inactive_frames: Option<u64>,
+    pub missing_input_samples: Option<u64>,
+    pub consumed_input_samples: Option<u64>,
+    pub output_rate: Option<u32>,
+    pub budget_us: Option<u64>,
+    pub ring_before: Option<usize>,
+    pub ring_after: Option<usize>,
+    pub reason: Option<&'static str>,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
     #[serde(flatten)]
@@ -63,10 +100,12 @@ pub struct Snapshot {
     pub current_device_id: Option<String>,
     pub current_session_id: Option<String>,
     pub enabled: bool,
+    pub enabled_changes: u64,
     pub counts: [u64; 7],
     pub counts_60s: [u64; 7],
     pub event_types: Vec<EventType>,
     pub drop_count: u64,
+    pub observation_drop_count: u64,
     pub recent: Vec<Record>,
     pub event_log_path: Option<String>,
     pub event_log_error: Option<String>,
@@ -83,7 +122,10 @@ pub struct Diagnostics {
     origin: Instant,
     clock_id: String,
     pub(crate) queue: ArrayQueue<Event>,
+    observations: ArrayQueue<Observation>,
+    observation_drops: AtomicU64,
     enabled: AtomicBool,
+    enabled_changes: AtomicU64,
     drops: AtomicU64,
     counts: [AtomicU64; 7],
     pub(crate) stream: AtomicU64,
@@ -100,13 +142,33 @@ impl Diagnostics {
         std::thread::spawn(move || {
             let mut log: Option<File> = None;
             let mut bytes = 0usize;
+            let mut last_health = 0;
             while let Some(d) = weak.upgrade() {
-                let records = d.drain();
+                let mut records: Vec<serde_json::Value> = d
+                    .drain()
+                    .iter()
+                    .map(|r| serde_json::to_value(r).unwrap())
+                    .collect();
+                records.extend(d.drain_observations());
+                let now = d.now_us();
+                if now.saturating_sub(last_health) >= 100_000 {
+                    last_health = now;
+                    let snapshot = d.snapshot();
+                    records.push(serde_json::json!({
+                        "record_type": "diagnostic_health", "rx_monotonic_us": now,
+                        "clock_id": snapshot.clock_id, "stream_id": snapshot.current_stream_id,
+                        "session_id": snapshot.current_session_id, "device_id": snapshot.current_device_id,
+                        "enabled": snapshot.enabled, "event_drops": snapshot.drop_count,
+                        "enabled_changes": snapshot.enabled_changes,
+                        "observation_drops": snapshot.observation_drop_count,
+                        "log_error": snapshot.event_log_error,
+                    }));
+                }
                 for record in records {
                     let result = (|| -> std::io::Result<()> {
-                        if bytes >= 8 * 1024 * 1024 {
+                        if bytes >= 64 * 1024 * 1024 {
                             return Err(std::io::Error::other(
-                                "event log reached 8 MiB limit; memory diagnostics continue",
+                                "event log reached 64 MiB limit; memory diagnostics continue",
                             ));
                         }
                         if log.is_none() && d.state.lock().unwrap().error.is_none() {
@@ -154,7 +216,10 @@ impl Diagnostics {
                 CLOCK_SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ),
             queue: ArrayQueue::new(capacity),
+            observations: ArrayQueue::new(capacity.max(4096)),
+            observation_drops: AtomicU64::new(0),
             enabled: AtomicBool::new(true),
+            enabled_changes: AtomicU64::new(0),
             drops: AtomicU64::new(0),
             counts: std::array::from_fn(|_| AtomicU64::new(0)),
             stream: AtomicU64::new(0),
@@ -168,7 +233,9 @@ impl Diagnostics {
         self.origin.elapsed().as_micros() as u64
     }
     pub fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
+        if self.enabled.swap(enabled, Ordering::Relaxed) != enabled {
+            self.enabled_changes.fetch_add(1, Ordering::Relaxed);
+        }
     }
     pub fn set_context(&self, device: &str, session: &str) {
         let id = self.stream.load(Ordering::Relaxed) + 1;
@@ -178,6 +245,8 @@ impl Diagnostics {
             contexts.pop_first();
         }
         self.stream.store(id, Ordering::Release);
+        drop(contexts);
+        self.observe(self.observation("stream_start"));
     }
     #[allow(clippy::too_many_arguments)] // Fixed scalar RT payload; no allocation or locking.
     pub fn emit(
@@ -233,6 +302,34 @@ impl Diagnostics {
             self.drops.fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn observe(&self, observation: Observation) {
+        if self.enabled.load(Ordering::Relaxed) && self.observations.push(observation).is_err() {
+            self.observation_drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn observation(&self, record_type: &'static str) -> Observation {
+        Observation {
+            record_type,
+            rx_monotonic_us: self.now_us(),
+            stream_id: self.stream.load(Ordering::Acquire),
+            ..Observation::default()
+        }
+    }
+    pub(crate) fn drain_observations(&self) -> Vec<serde_json::Value> {
+        let mut records = Vec::new();
+        for _ in 0..self.observations.capacity() {
+            let Some(o) = self.observations.pop() else {
+                break;
+            };
+            let context = self.contexts.lock().unwrap().get(&o.stream_id).cloned();
+            let mut value = serde_json::to_value(o).unwrap();
+            value["clock_id"] = self.clock_id.clone().into();
+            value["device_id"] = serde_json::to_value(context.as_ref().map(|c| &c.0)).unwrap();
+            value["session_id"] = serde_json::to_value(context.as_ref().map(|c| &c.1)).unwrap();
+            records.push(value);
+        }
+        records
+    }
     pub(crate) fn drain(&self) -> Vec<Record> {
         let mut records = Vec::new();
         // Fixed work bound even if producers keep the queue busy.
@@ -285,10 +382,12 @@ impl Diagnostics {
             current_device_id: context.as_ref().map(|c| c.0.clone()),
             current_session_id: context.map(|c| c.1),
             enabled: self.enabled.load(Ordering::Relaxed),
+            enabled_changes: self.enabled_changes.load(Ordering::Relaxed),
             counts: std::array::from_fn(|i| self.counts[i].load(Ordering::Relaxed)),
             counts_60s,
             event_types: EVENT_TYPES.to_vec(),
             drop_count: self.drops.load(Ordering::Relaxed),
+            observation_drop_count: self.observation_drops.load(Ordering::Relaxed),
             recent: state.recent.iter().cloned().collect(),
             event_log_path: state.path.clone(),
             event_log_error: state.error.clone(),
@@ -314,6 +413,26 @@ pub(crate) fn wall_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observation_overflow_disable_and_session_identity() {
+        let d = Diagnostics::bounded(1);
+        d.set_context("device", "first");
+        for _ in 0..4096 {
+            d.observe(d.observation("udp_receive"));
+        }
+        assert!(d.snapshot().observation_drop_count > 0);
+        let rows = d.drain_observations();
+        assert_eq!(rows.len(), 4096);
+        assert!(rows.iter().all(|r| r["session_id"] == "first"));
+        d.set_enabled(false);
+        d.observe(d.observation("audio_callback"));
+        assert!(d.drain_observations().is_empty());
+        d.set_enabled(true);
+        d.set_context("device", "second");
+        let rows = d.drain_observations();
+        assert_eq!(rows[0]["session_id"], "second");
+        assert_eq!(rows[0]["stream_id"], 2);
+    }
     #[test]
     fn bounded_drop_disabled_and_context() {
         let d = Diagnostics::bounded(1);

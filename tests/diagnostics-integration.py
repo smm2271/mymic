@@ -89,6 +89,22 @@ try:
     assert 30_000_000 <= ended['ended_monotonic_us'] - started['started_monotonic_us'] < 32_000_000
     metadata = json.loads(Path(ended['metadata_path']).read_text())
     assert metadata['clock_id'] == continuity['clock_id'] and metadata['frames'] == []
+    time.sleep(.2)  # let bounded diagnostic worker drain the capture tail
+    assert metadata['observation_drop_count_end'] == metadata['observation_drop_count_start'] == 0
+    rows = [json.loads(line) for line in Path(metadata['event_log_path']).read_text().splitlines()]
+    kinds = {r.get('record_type') for r in rows}
+    assert {'udp_receive', 'jitter_enqueue', 'jitter_dequeue', 'sequence_status', 'diagnostic_health'} <= kinds
+    arrivals = [r for r in rows if r.get('record_type') == 'udp_receive']
+    assert all(r['session_id'] == metadata['session_id'] and r['clock_id'] == metadata['clock_id'] for r in arrivals)
+    assert any(r['out_of_order'] for r in arrivals)
+    subprocess.run(['python', '-X', 'utf8', str(ROOT / 'scripts/analyze-continuity.py'), metadata['event_log_path'],
+                    '--capture', ended['metadata_path'], '--output', str(ROOT / 'artifacts/diagnostics-analysis.jsonl')], check=True)
+    report = [json.loads(line) for line in (ROOT / 'artifacts/diagnostics-analysis.jsonl').read_text(encoding='utf8').splitlines()]
+    summary = report[0]
+    assert summary['packets']['count'] > 0 and summary['inter_arrival_us']['p99'] is not None
+    assert not summary['callback_interval_us']['collected']
+    assert any('Unknown / Insufficient Evidence' in r['candidates'] for r in report if r['record_type'] == 'root_cause_candidates')
+    print('PASS normal observations, same-session capture correlation and evidence report; headless callbacks unknown', flush=True)
     print('PASS actual wall-clock 30-second auto-stop and sidecar clock correlation (headless)', flush=True)
 finally:
     for p, log in reversed(processes):

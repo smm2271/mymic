@@ -13,6 +13,16 @@ pub struct SequenceTracker {
     pub duplicates: u64,
 }
 impl SequenceTracker {
+    /// Holes currently visible inside the bounded reorder window; not finalized loss.
+    pub fn pending_holes(&self) -> u64 {
+        match (self.expected, self.highest) {
+            (Some(expected), Some(highest)) if !ahead(expected, highest) => {
+                (highest.wrapping_sub(expected) as u64 + 1)
+                    .saturating_sub(self.pending.len() as u64)
+            }
+            _ => 0,
+        }
+    }
     pub fn observe(&mut self, sequence: u32, now: u64) {
         if self.recent.contains(&sequence) {
             self.duplicates += 1;
@@ -80,7 +90,9 @@ mod tests {
         let mut t = SequenceTracker::default();
         t.observe(0, 0);
         t.observe(2, 10);
+        assert_eq!(t.pending_holes(), 1);
         t.observe(1, 30);
+        assert_eq!(t.pending_holes(), 0);
         t.finalize(100);
         assert_eq!(t.gaps, 0);
         assert_eq!(t.reordered, 1);

@@ -58,6 +58,15 @@ try:
     assert len(metadata['frames']) * 160 == capture['samples']
     assert metadata['device_id'] == 'diag-output'
     assert all(frame['sample_offset'] == i*160 for i,frame in enumerate(metadata['frames']))
+    time.sleep(.2)
+    rows = [json.loads(line) for line in Path(metadata['event_log_path']).read_text().splitlines()]
+    callbacks = [r for r in rows if r.get('record_type') == 'audio_callback'
+                 and r['stream_id'] == metadata['stream_id'] and
+                 metadata['started_monotonic_us'] <= r['rx_monotonic_us'] <= metadata['ended_monotonic_us']]
+    assert callbacks and all(r['session_id'] == metadata['session_id'] for r in callbacks)
+    assert all(0 <= r['supplied_frames'] <= r['requested_frames'] for r in callbacks)
+    assert any(r['consumed_input_samples'] > 0 for r in callbacks)
+    assert metadata['observation_drop_count_end'] == metadata['observation_drop_count_start'] == 0
     metrics = request('/metrics')
     assert metrics['input_samples_consumed'] > before and metrics['output_sample_rate'] > 0
     (ROOT/'artifacts/diagnostics-output-result.json').write_text(json.dumps({'capture':capture,'output_sample_rate':metrics['output_sample_rate'],'output_channels':metrics['output_channels']}, indent=2),encoding='utf8')

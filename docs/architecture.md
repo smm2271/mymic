@@ -9,11 +9,12 @@ Angular 透過 localhost REST 發出控制，WebSocket 每 500 ms 取得裝置�
 * `mic-protocol`：Little Endian byte encoder/decoder；binary authentication；與 JSON 排序無關的控制簽章；Sine、Sweep、Pulse、Silence。
 * `mic-device`：OFFLINE／DISCOVERED／PAIRING／CONNECTED／STREAMING，提供可測試合法轉換規則。Network actor 根據已確認事件管理實際狀態，尚未回 ACK 的設定不先標示成功。
 * `mic-network`：單一 Tokio actor 同時接收三個 UDP sockets、命令 channel、10 ms playout timer 與維護 timer。Device registry 上限 64；一個裝置至多一個 pending command batch。最多同時一個音訊串流，多個裝置可探索／配對。START 預先保留播放擁有權，防止同時請求競爭。
-* `mic-audio`：jitter 最多 8 包；目標 prebuffer 為 2–4 包。遇到 overflow 丟棄舊積壓，三個連續空 deadline 後重新 prebuffer，避免時鐘停頓造成永久靜音。loss 用 playout deadline 缺包計算，不當成無線鏈路物理丟包率。
+* `mic-audio`：jitter 最多 8 包；目標 prebuffer 為 2–4 包。預設 overflow 策略保留靠近 expected 的八包，替換最遠或拒絕 incoming；legacy isolation option 才清空積壓。三個連續空 deadline 後重新 prebuffer，避免時鐘停頓造成永久靜音。loss 用 playout deadline 缺包計算，不當成無線鏈路物理丟包率。
 * 播放 sample queue：`crossbeam_queue::ArrayQueue`，最多 1600 個 mono samples（100 ms）；積壓超過 960 samples 時清除舊資料防止延遲累加。CPAL callback 不分配、不使用 mutex、不做網路或 HTTP；只從佇列取样、重取樣、複製到裝置聲道並更新 atomic counters。裝置錯誤通知回呼另更新輸出錯誤狀態。
 * 專屬 playback thread 保有 CPAL Stream，用 bounded command channel 切換裝置；API 使用 `spawn_blocking` 等待開啟結果。
 * gain/mute 在 TX 軟體音源實施，接收核心送出已驗證命令，ACK 後才更新顯示。不是第二次疊加增益。
 * Windows 10 ms timer 使用成對 `timeBeginPeriod(1)`／`timeEndPeriod(1)` request；Windows 排程仍不具硬即時保證。
+* Continuity Diagnostics 延用同一 RX monotonic origin、bounded producer queues 和背景 JSONL worker。Packet、jitter、ring、callback 與 capture 可依 Session/stream/clock 關聯，離線分析保留證據及未知項，詳見 [continuity-timeline.md](continuity-timeline.md)。
 
 重取樣保留跨 callback 的相位，以實際 Windows default output config sample rate 為準，可用 48 kHz、44.1 kHz 或其他率。支援 F32、I16、U16 的 mono→多聲道複製；輸出裝置以當次列舉索引選擇。線性重取樣不是高品質帶限 resampler。
 

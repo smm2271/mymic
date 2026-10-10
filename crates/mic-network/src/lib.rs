@@ -239,11 +239,12 @@ async fn run(
                                                      else {pending.sent=Instant::now();pending.retries=0;send(&socket,&pending.messages[pending.position],e.peer).await;e.pending=Some(pending);}
                                                     },
                                                     Ok((n,peer))=audio.recv_from(&mut ab)=>{
+         let arrival_us=engine.playback.diagnostics.now_us();
          engine.jitter.metrics.received_datagrams+=1;
          if let Some(id)=&active && let Some(e)=entries.get_mut(id) {
           if peer.ip()!=e.peer.ip(){engine.jitter.metrics.rejected_packets+=1;engine.jitter.metrics.session_rejections+=1;continue}
           match AudioPacket::decode(&ab[..n],&e.key) {
-           Ok(p) if hex::encode(p.session)==e.session && e.device.state==State::Streaming=>{e.last=Instant::now();engine.receive(p);account_audio(&engine,e,&mut audio_baseline)},
+           Ok(p) if hex::encode(p.session)==e.session && e.device.state==State::Streaming=>{e.last=Instant::now();engine.receive_at(p,arrival_us);account_audio(&engine,e,&mut audio_baseline)},
            Ok(_)=>{engine.jitter.metrics.rejected_packets+=1;engine.jitter.metrics.session_rejections+=1;},
            Err(error)=>{engine.jitter.metrics.rejected_packets+=1;engine.jitter.metrics.invalid_packets+=1;if error.to_string().contains("authentication"){engine.jitter.metrics.authentication_failures+=1;}else{engine.jitter.metrics.invalid_packet_headers+=1;}}
           }

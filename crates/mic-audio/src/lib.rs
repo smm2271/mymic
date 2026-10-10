@@ -310,6 +310,25 @@ impl Jitter {
             .count()
     }
     pub fn push(&mut self, p: AudioPacket) {
+        let sequence = p.sequence;
+        let before = self.occupancy();
+        let accepted = self.metrics.accepted_packets;
+        self.push_inner(p);
+        if let Some(d) = &self.diagnostics {
+            let mut o = d.observation("jitter_enqueue");
+            o.packet_sequence = Some(sequence);
+            o.expected_sequence = self.expected;
+            o.occupancy = Some(self.occupancy());
+            o.occupancy_before = Some(before);
+            o.contiguous_depth = Some(self.contiguous_playable_depth());
+            o.capacity = Some(8);
+            o.late_packet_count = Some(self.metrics.late_packet_drops);
+            o.underrun_count = Some(self.metrics.buffer_underruns);
+            o.admitted = Some(self.metrics.accepted_packets > accepted);
+            d.observe(o);
+        }
+    }
+    fn push_inner(&mut self, p: AudioPacket) {
         if !self.capacity_policy {
             self.push_legacy(p);
             return;
@@ -455,6 +474,26 @@ impl Jitter {
         self.metrics.jitter_buffer_depth = self.packets.len();
     }
     pub fn tick(&mut self) -> [i16; 160] {
+        let expected = self.expected;
+        let before = self.occupancy();
+        let delivered = self.metrics.delivered_packets;
+        let output = self.tick_inner();
+        if let Some(d) = &self.diagnostics {
+            let mut o = d.observation("jitter_dequeue");
+            o.expected_sequence = expected;
+            o.occupancy = Some(self.occupancy());
+            o.occupancy_before = Some(before);
+            o.contiguous_depth = Some(self.contiguous_playable_depth());
+            o.capacity = Some(8);
+            o.late_packet_count = Some(self.metrics.late_packet_drops);
+            o.underrun_count = Some(self.metrics.buffer_underruns);
+            o.delivered = Some(self.metrics.delivered_packets > delivered);
+            o.started = Some(self.started);
+            d.observe(o);
+        }
+        output
+    }
+    fn tick_inner(&mut self) -> [i16; 160] {
         if !self.started {
             if self.packets.len() < self.depth {
                 self.last_tick_missing = true;
@@ -690,6 +729,10 @@ impl Playback {
             }
         }
         self.active.store(true, Ordering::Release);
+        let mut o = self.diagnostics.observation("playback_feed");
+        o.ring_after = Some(self.queue.len());
+        o.capacity = Some(self.queue.capacity());
+        self.diagnostics.observe(o);
     }
     fn open(&self, id: &str) -> Result<(cpal::Stream, String)> {
         let host = cpal::default_host();
@@ -741,17 +784,40 @@ impl Playback {
             c,
             move |data: &mut [T], _| {
                 let now = Instant::now();
+                let mut observation = diagnostics.observation("audio_callback");
+                observation.interval_us = monitor
+                    .previous
+                    .map(|(t, _)| now.saturating_duration_since(t).as_micros() as u64);
+                observation.budget_us = monitor.previous.map(|(_, budget)| budget);
+                if monitor.stream != observation.stream_id {
+                    observation.interval_us = None;
+                    observation.budget_us = None;
+                }
+                observation.ring_before = Some(queue.len());
+                let running = active.load(Ordering::Relaxed) && renderer.primed();
+                observation.started = Some(running);
                 counters.callback(diagnostics.now_us(), output_rate);
                 monitor.begin(
                     now,
                     data.len() / channels,
-                    active.load(Ordering::Relaxed) && renderer.primed(),
+                    running,
                     queue.len(),
                     &diagnostics,
                 );
                 output_frames.fetch_add((data.len() / channels) as u64, Ordering::Relaxed);
                 output_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
                 let stats = renderer.render(data, channels, &queue, &active, &epoch);
+                observation.requested_frames = Some((data.len() / channels) as u64);
+                observation.supplied_frames = Some(stats.supplied_frames);
+                observation.inserted_frames = Some(stats.inserted_frames);
+                observation.starvation_frames = Some(stats.starvation_frames);
+                observation.prefill_frames = Some(stats.prefill_frames);
+                observation.inactive_frames = Some(stats.inactive_frames);
+                observation.missing_input_samples = Some(stats.missing_input_samples);
+                observation.consumed_input_samples = Some(stats.consumed);
+                observation.output_rate = Some(output_rate);
+                observation.ring_after = Some(queue.len());
+                diagnostics.observe(observation);
                 counters.record(&stats);
                 input_samples.fetch_add(stats.consumed, Ordering::Relaxed);
                 if stats.rendered {
@@ -796,6 +862,7 @@ pub struct Engine {
     inter_arrival_jitter_ms: f64,
     last_inter_arrival_interval_ms: Option<f64>,
     last_timestamp: Option<u32>,
+    diagnostic_arrival_us: Option<u64>,
 }
 impl Engine {
     pub fn new(depth: usize) -> Self {
@@ -817,6 +884,7 @@ impl Engine {
             inter_arrival_jitter_ms: 0.0,
             last_inter_arrival_interval_ms: None,
             last_timestamp: None,
+            diagnostic_arrival_us: None,
         }
     }
     pub fn inter_arrival_jitter_ms(&self) -> f64 {
@@ -832,6 +900,11 @@ impl Engine {
         self.declicker.fade_ins
     }
     pub fn receive(&mut self, p: AudioPacket) {
+        let arrival_us = self.playback.diagnostics.now_us();
+        self.receive_at(p, arrival_us);
+    }
+    /// Timestamp at socket receive completion, before authentication/decode work.
+    pub fn receive_at(&mut self, p: AudioPacket, arrival_us: u64) {
         let now = Instant::now();
         if let (Some(prev_time), Some(prev_ts)) = (self.last_arrival, self.last_timestamp) {
             let delta_ms = now.duration_since(prev_time).as_secs_f64() * 1000.0;
@@ -843,8 +916,23 @@ impl Engine {
         self.last_arrival = Some(now);
         self.last_timestamp = Some(p.timestamp);
 
+        let reordered = self.sequence.reordered;
+        let duplicates = self.sequence.duplicates;
         self.sequence
             .observe(p.sequence, self.started.elapsed().as_millis() as u64);
+        let d = &self.playback.diagnostics;
+        let mut o = d.observation("udp_receive");
+        o.rx_monotonic_us = arrival_us;
+        o.packet_sequence = Some(p.sequence);
+        o.interval_us = self
+            .diagnostic_arrival_us
+            .map(|t| arrival_us.saturating_sub(t));
+        o.sequence_gaps = Some(self.sequence.gaps);
+        o.pending_sequence_holes = Some(self.sequence.pending_holes());
+        o.out_of_order = Some(self.sequence.reordered > reordered);
+        o.duplicate = Some(self.sequence.duplicates > duplicates);
+        d.observe(o);
+        self.diagnostic_arrival_us = Some(arrival_us);
         self.bytes += 320;
         self.jitter.push(p);
         self.update_diagnostic_depth();
@@ -867,6 +955,10 @@ impl Engine {
             .finalize(self.started.elapsed().as_millis() as u64);
         self.jitter.metrics.sequence_gaps = self.sequence.gaps;
         self.jitter.metrics.sequence_out_of_order = self.sequence.reordered;
+        let mut o = self.playback.diagnostics.observation("sequence_status");
+        o.sequence_gaps = Some(self.sequence.gaps);
+        o.pending_sequence_holes = Some(self.sequence.pending_holes());
+        self.playback.diagnostics.observe(o);
         let was_started = self.jitter.started;
         let f = self.jitter.tick();
         self.update_diagnostic_depth();
@@ -880,6 +972,10 @@ impl Engine {
         }
     }
     pub fn reset(&mut self) {
+        self.playback
+            .diagnostics
+            .observe(self.playback.diagnostics.observation("stream_reset"));
+        self.diagnostic_arrival_us = None;
         self.sequence.reset();
         self.last_arrival = None;
         self.last_timestamp = None;
@@ -943,6 +1039,89 @@ mod tests {
             session: [0; 16],
             samples: [n as i16; 160],
         }
+    }
+    #[test]
+    fn timeline_observes_admission_loss_burst_and_recovery_without_changing_pcm() {
+        let d = diagnostics::Diagnostics::bounded(128);
+        d.set_context("tx", "session");
+        let mut observed = Jitter::new(2);
+        observed.diagnostics = Some(d.clone());
+        let mut plain = Jitter::new(2);
+        // Normal, single/contiguous missing, reordering, duplicate, bursts, delayed packet.
+        for batch in [
+            vec![0, 1],
+            vec![3, 2, 2],
+            vec![5],
+            vec![],
+            vec![],
+            vec![4, 8, 10, 9, 11, 12, 13, 14, 15, 16, 17],
+            vec![],
+        ] {
+            for n in batch {
+                observed.push(packet(n));
+                plain.push(packet(n));
+            }
+            assert_eq!(observed.tick(), plain.tick());
+        }
+        for _ in 0..15 {
+            assert_eq!(observed.tick(), plain.tick());
+        }
+        let rows = d.drain_observations();
+        assert!(
+            rows.iter()
+                .any(|r| r["record_type"] == "jitter_enqueue" && r["admitted"] == false)
+        );
+        assert!(rows.iter().any(|r| r["record_type"] == "jitter_dequeue"
+            && r["delivered"] == false
+            && r["started"] == true));
+        assert!(rows.iter().all(|r| r["session_id"] == "session"));
+        assert!(
+            rows.iter()
+                .filter(|r| r["capacity"] == 8)
+                .all(|r| r["occupancy"].as_u64().unwrap() <= 8)
+        );
+        d.set_enabled(false);
+        observed.reset();
+        plain.reset();
+        for n in 0..10 {
+            observed.push(packet(n));
+            plain.push(packet(n));
+            assert_eq!(observed.tick(), plain.tick());
+        }
+        assert!(d.drain_observations().is_empty());
+    }
+    #[test]
+    fn udp_timeline_preserves_socket_timestamp_duplicates_and_reordering() {
+        let mut e = Engine::new(2);
+        let d = diagnostics::Diagnostics::bounded(128);
+        e.playback.diagnostics = d.clone();
+        e.jitter.diagnostics = Some(d.clone());
+        e.set_context("tx", "one");
+        for (sequence, time) in [(0, 100), (2, 10100), (1, 20100), (1, 20101)] {
+            e.receive_at(packet(sequence), time);
+        }
+        let rows = d.drain_observations();
+        let arrivals: Vec<_> = rows
+            .iter()
+            .filter(|r| r["record_type"] == "udp_receive")
+            .collect();
+        assert_eq!(arrivals.len(), 4);
+        assert_eq!(arrivals[0]["rx_monotonic_us"], 100);
+        assert!(arrivals[0]["interval_us"].is_null());
+        assert_eq!(arrivals[1]["interval_us"], 10000);
+        assert_eq!(arrivals[2]["out_of_order"], true);
+        assert_eq!(arrivals[3]["duplicate"], true);
+        e.reset();
+        e.set_context("tx", "two");
+        e.receive_at(packet(0), 50000);
+        let rows = d.drain_observations();
+        let arrival = rows
+            .iter()
+            .find(|r| r["record_type"] == "udp_receive")
+            .unwrap();
+        assert_eq!(arrival["session_id"], "two");
+        assert!(arrival["interval_us"].is_null());
+        e.playback.shutdown();
     }
     #[test]
     fn diagnostic_normal_delay_loss_resync_and_disabled_equivalence() {

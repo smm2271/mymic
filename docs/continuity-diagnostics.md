@@ -1,5 +1,7 @@
 # Audio continuity diagnostics v0.6.2
 
+Current normal-path packet/jitter/callback observations, the 64 MiB log limit, capture correlation and evidence classifier are documented in [continuity timeline](continuity-timeline.md). The inventory below describes the v0.6.2 baseline; current default capacity decisions follow [v0.6.3](audio-continuity-v063.md), rather than clearing all buffered packets.
+
 ## Phase 0: code inventory (before changes)
 
 * ESP32 generation uses `vTaskDelayUntil(10 ms)` and a bounded FreeRTOS frame queue. Queue overflow removes the oldest frame. Sequence increments at generation, not UDP delivery. The original `generated_us` precedes PCM generation; the original queue-delay measurement also includes generation and transport's context snapshot. The original send-duration measurement includes encoding and HMAC, not just `sendto`.
