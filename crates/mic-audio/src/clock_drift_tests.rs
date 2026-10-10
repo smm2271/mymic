@@ -9,18 +9,28 @@ use mic_protocol::AudioPacket;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 #[derive(Default, Debug, PartialEq)]
-struct Result {
-    checksum: u64,
-    missing: u64,
-    capacity_drops: u64,
+pub(super) struct Result {
+    pub(super) checksum: u64,
+    pub(super) missing: u64,
+    pub(super) capacity_drops: u64,
     starved: u64,
     clear: u64,
     max_jitter: usize,
     max_ring: usize,
     delivered: u64,
-    levels: Vec<(u64, usize, usize, u64, u64)>,
+    pub(super) levels: Vec<(u64, usize, usize, u64, u64)>,
 }
 fn run(tx_ppm: i32, device_ppm: i32, enabled: bool, faults: bool, seconds: u64) -> Result {
+    run_profile(tx_ppm, device_ppm, enabled, faults, seconds, None)
+}
+pub(super) fn run_profile(
+    tx_ppm: i32,
+    device_ppm: i32,
+    enabled: bool,
+    faults: bool,
+    seconds: u64,
+    mut investigation: Option<&mut super::clock_amplification_tests::Investigation>,
+) -> Result {
     let diagnostics = Diagnostics::bounded(128);
     diagnostics.set_enabled(enabled);
     let mut jitter = Jitter::new(3);
@@ -40,6 +50,7 @@ fn run(tx_ppm: i32, device_ppm: i32, enabled: bool, faults: bool, seconds: u64) 
     let mut pcm = [0f32; 160];
     let end = seconds as f64 * 1e9;
     let mut next_level = 1u64;
+    let mut switched = None;
     loop {
         let arrival = delayed
             .iter()
@@ -49,13 +60,24 @@ fn run(tx_ppm: i32, device_ppm: i32, enabled: bool, faults: bool, seconds: u64) 
         if now >= end {
             break;
         }
-        if now == tx {
+        let before = investigation
+            .as_ref()
+            .map(|_| super::clock_amplification_tests::State::read(&jitter, &diagnostics));
+        let mut packet_context = None;
+        let kind;
+        let prefer_tick = investigation
+            .as_ref()
+            .is_some_and(|o| o.tie_tick_first && o.first_drop_ns.is_some())
+            && now == tick;
+        if now == tx && !prefer_tick {
+            kind = "generate";
             let p = AudioPacket {
                 sequence,
                 timestamp: sequence.wrapping_mul(160),
                 session: [0; 16],
                 samples: [(sequence % 300) as i16; 160],
             };
+            packet_context = Some((p.sequence, p.timestamp));
             if !faults || !sequence.is_multiple_of(127) {
                 delayed.push((
                     now + if faults && sequence.is_multiple_of(211) {
@@ -67,12 +89,19 @@ fn run(tx_ppm: i32, device_ppm: i32, enabled: bool, faults: bool, seconds: u64) 
                 ));
             }
             sequence = sequence.wrapping_add(1);
-            tx = sequence as f64 * period(tx_ppm);
-        } else if now == arrival {
+            tx = if let Some((base_seq, base_time, ppm)) = switched {
+                base_time + sequence.wrapping_sub(base_seq) as f64 * period(ppm)
+            } else {
+                sequence as f64 * period(tx_ppm)
+            };
+        } else if now == arrival && !prefer_tick {
+            kind = "arrival";
             let i = delayed.iter().position(|(t, _)| *t == arrival).unwrap();
             let (_, p) = delayed.swap_remove(i);
+            packet_context = Some((p.sequence, p.timestamp));
             jitter.push(p);
         } else if now == tick {
+            kind = "playout";
             let was = jitter.started;
             let frame = jitter.tick();
             let missing = jitter.last_tick_missing;
@@ -97,6 +126,7 @@ fn run(tx_ppm: i32, device_ppm: i32, enabled: bool, faults: bool, seconds: u64) 
             }
             tick += 10_000_000.0;
         } else {
+            kind = "callback";
             let stats = renderer.render(&mut pcm, 1, &queue, &active, &epoch);
             result.starved += stats.short as u64;
             for s in pcm {
@@ -106,6 +136,26 @@ fn run(tx_ppm: i32, device_ppm: i32, enabled: bool, faults: bool, seconds: u64) 
                     .wrapping_add(s.to_bits() as u64);
             }
             callback += period(device_ppm);
+        }
+        if let Some(observer) = investigation.as_mut() {
+            observer.observe(
+                now,
+                kind,
+                packet_context,
+                before.unwrap(),
+                super::clock_amplification_tests::State::read(&jitter, &diagnostics),
+                &diagnostics,
+            );
+            if switched.is_none()
+                && observer.first_drop_ns.is_some()
+                && let Some(ppm) = observer.switch_to
+            {
+                // Preserve the fraction remaining to the NEXT generation, not a
+                // sequence*new_period time jump. Source indices never reset.
+                tx = now + (tx - now) * period(ppm) / period(tx_ppm);
+                switched = Some((sequence, tx, ppm));
+                observer.switch_ns = Some(now);
+            }
         }
         result.max_jitter = result.max_jitter.max(jitter.occupancy());
         result.max_ring = result.max_ring.max(queue.len());
@@ -125,7 +175,7 @@ fn run(tx_ppm: i32, device_ppm: i32, enabled: bool, faults: bool, seconds: u64) 
                 jitter.metrics.jitter_buffer_drops,
             ));
             next_level += 1;
-            assert!(result.levels.len() <= 1800);
+            assert!(result.levels.len() <= seconds as usize);
         }
     }
     result.missing = jitter.metrics.lost_packets;

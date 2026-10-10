@@ -1,5 +1,7 @@
 pub mod capture;
 #[cfg(test)]
+mod clock_amplification_tests;
+#[cfg(test)]
 mod clock_drift_tests;
 #[cfg(test)]
 mod continuity_regression;
