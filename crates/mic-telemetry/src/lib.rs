@@ -69,6 +69,12 @@ pub struct DeviceInput {
     pub activity_epoch: u64,
     pub counter_timestamp_ms: Option<u64>,
     pub tx: Option<mic_protocol::diagnostics::TxTiming>,
+    pub rx_inter_arrival_jitter_ms: Option<f64>,
+    pub sequence_gaps: u64,
+    pub late_packet_drops: u64,
+    pub target_buffer_depth: usize,
+    pub underrun_fade_outs: u64,
+    pub recovery_fade_ins: u64,
 }
 #[derive(Clone)]
 pub struct Inputs {
@@ -110,6 +116,11 @@ pub struct TelemetrySnapshot {
     pub tx_packet_rate: Option<f64>,
     pub tx_scheduling_drift_ms: Option<f64>,
     pub tx: Option<mic_protocol::diagnostics::TxTiming>,
+    pub rx_inter_arrival_jitter_ms: Option<f64>,
+    pub sequence_gaps_delta: Option<u64>,
+    pub late_packet_drops_delta: Option<u64>,
+    pub target_buffer_depth: Option<usize>,
+    pub audio_continuity_events_delta: Option<u64>,
 }
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -119,6 +130,10 @@ pub enum EventType {
     Disconnect,
     Reconnect,
     SessionChanged,
+    BufferUnderrun,
+    BufferOverrun,
+    DeadlineMiss,
+    BufferResync,
 }
 #[derive(Clone)]
 pub struct EventInput {
@@ -126,6 +141,9 @@ pub struct EventInput {
     pub device_id: String,
     pub session_id: Option<String>,
     pub event_type: EventType,
+    pub sequence_number: Option<u32>,
+    pub buffer_depth: Option<usize>,
+    pub target_depth: Option<usize>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct TelemetryEvent {
@@ -135,6 +153,12 @@ pub struct TelemetryEvent {
     pub device_id: String,
     pub session_id: Option<String>,
     pub event_type: EventType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_depth: Option<usize>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -271,6 +295,34 @@ impl Store {
                 let total = d.received_packets.saturating_add(d.lost_packets);
                 (total > 0).then(|| d.lost_packets as f64 / total as f64 * 100.0)
             });
+            let continuity_events_delta = if let (Some(previous), true) = (&history.previous, fresh)
+            {
+                let prev_events = previous
+                    .input
+                    .underrun_fade_outs
+                    .saturating_add(previous.input.recovery_fade_ins);
+                let cur_events = input
+                    .underrun_fade_outs
+                    .saturating_add(input.recovery_fade_ins);
+                cur_events.checked_sub(prev_events)
+            } else {
+                None
+            };
+            let sequence_gaps_delta = if let (Some(previous), true) = (&history.previous, fresh) {
+                input
+                    .sequence_gaps
+                    .checked_sub(previous.input.sequence_gaps)
+            } else {
+                None
+            };
+            let late_packet_drops_delta = if let (Some(previous), true) = (&history.previous, fresh)
+            {
+                input
+                    .late_packet_drops
+                    .checked_sub(previous.input.late_packet_drops)
+            } else {
+                None
+            };
             let sample = TelemetrySnapshot {
                 id,
                 sequence,
@@ -306,6 +358,13 @@ impl Store {
                     .then(|| input.tx.as_ref().map(|t| t.scheduling_drift_ms))
                     .flatten(),
                 tx: input.tx.clone(),
+                rx_inter_arrival_jitter_ms: (streaming && fresh)
+                    .then_some(input.rx_inter_arrival_jitter_ms)
+                    .flatten(),
+                sequence_gaps_delta,
+                late_packet_drops_delta,
+                target_buffer_depth: (streaming && fresh).then_some(input.target_buffer_depth),
+                audio_continuity_events_delta: continuity_events_delta,
                 discontinuity,
             };
             if history.snapshots.len() == CAPACITY {
@@ -343,6 +402,9 @@ impl Store {
             device_id: input.device_id.clone(),
             session_id: input.session_id,
             event_type: input.event_type,
+            sequence_number: input.sequence_number,
+            buffer_depth: input.buffer_depth,
+            target_depth: input.target_depth,
         };
         let h = self.devices.entry(input.device_id).or_default();
         h.prune(input.timestamp);
@@ -473,6 +535,17 @@ impl Telemetry {
         });
     }
     pub fn event(&self, id: &str, session: Option<String>, kind: EventType) {
+        self.event_with_context(id, session, kind, None, None, None);
+    }
+    pub fn event_with_context(
+        &self,
+        id: &str,
+        session: Option<String>,
+        kind: EventType,
+        sequence_number: Option<u32>,
+        buffer_depth: Option<usize>,
+        target_depth: Option<usize>,
+    ) {
         if self
             .events
             .try_send(EventInput {
@@ -480,6 +553,9 @@ impl Telemetry {
                 device_id: id.into(),
                 session_id: session,
                 event_type: kind,
+                sequence_number,
+                buffer_depth,
+                target_depth,
             })
             .is_err()
         {
@@ -548,6 +624,12 @@ mod tests {
             activity_epoch: 0,
             counter_timestamp_ms: None,
             tx: None,
+            rx_inter_arrival_jitter_ms: None,
+            sequence_gaps: 0,
+            late_packet_drops: 0,
+            target_buffer_depth: 3,
+            underrun_fade_outs: 0,
+            recovery_fade_ins: 0,
         }
     }
     fn feed(store: &mut Store, d: DeviceInput, t: u64) {
@@ -675,6 +757,9 @@ mod tests {
                 device_id: "a".into(),
                 session_id: None,
                 event_type: EventType::StartStream,
+                sequence_number: None,
+                buffer_depth: None,
+                target_depth: None,
             });
         }
         assert_eq!(
@@ -767,6 +852,12 @@ mod acquisition_tests {
             activity_epoch: 0,
             counter_timestamp_ms: Some(0),
             tx: None,
+            rx_inter_arrival_jitter_ms: None,
+            sequence_gaps: 0,
+            late_packet_drops: 0,
+            target_buffer_depth: 3,
+            underrun_fade_outs: 0,
+            recovery_fade_ins: 0,
         };
         store.sample(
             &Inputs {
@@ -794,5 +885,96 @@ mod acquisition_tests {
         assert_eq!(s.rx_packet_rate, Some(100.0));
         assert_eq!(s.receive_bitrate, Some(256000.0));
         assert!(s.tx_packet_rate.is_none());
+    }
+
+    #[test]
+    fn timing_diagnostics_and_continuity_deltas() {
+        let mut store = Store::new();
+        let mut input = DeviceInput {
+            device_id: "esp32-tx-1".into(),
+            session_id: Some("session-1".into()),
+            connection_state: State::Streaming,
+            counters: Counters {
+                received_packets: 100,
+                lost_packets: 2,
+                out_of_order_packets: 0,
+                received_bytes: 32000,
+                buffer_underruns: 1,
+                buffer_overruns: 0,
+            },
+            jitter_buffer_depth: 3,
+            activity_epoch: 0,
+            counter_timestamp_ms: Some(0),
+            tx: None,
+            rx_inter_arrival_jitter_ms: Some(1.25),
+            sequence_gaps: 2,
+            late_packet_drops: 1,
+            target_buffer_depth: 3,
+            underrun_fade_outs: 1,
+            recovery_fade_ins: 0,
+        };
+        store.sample(
+            &Inputs {
+                devices: vec![input.clone()],
+                updated: Instant::now(),
+            },
+            0,
+            0,
+            true,
+        );
+
+        input.counter_timestamp_ms = Some(1000);
+        input.counters.received_packets = 200;
+        input.counters.buffer_underruns = 2;
+        input.rx_inter_arrival_jitter_ms = Some(2.10);
+        input.sequence_gaps = 3;
+        input.late_packet_drops = 2;
+        input.underrun_fade_outs = 2;
+        input.recovery_fade_ins = 1;
+
+        store.sample(
+            &Inputs {
+                devices: vec![input],
+                updated: Instant::now(),
+            },
+            1000,
+            1000,
+            true,
+        );
+
+        let h = store.history("esp32-tx-1", Range::Seconds60, 1000).unwrap();
+        let s = h.snapshots.last().unwrap();
+        assert_eq!(s.rx_inter_arrival_jitter_ms, Some(2.10));
+        assert_eq!(s.target_buffer_depth, Some(3));
+        assert_eq!(s.sequence_gaps_delta, Some(1));
+        assert_eq!(s.late_packet_drops_delta, Some(1));
+        assert_eq!(s.audio_continuity_events_delta, Some(2)); // (2-1) + (1-0) = 2
+        // ESP32 device has no simulator TX report; must remain None (not fake zeros)
+        assert!(s.tx.is_none());
+        assert!(s.tx_packet_rate.is_none());
+    }
+
+    #[test]
+    fn event_types_with_context() {
+        let mut store = Store::new();
+        let event = EventInput {
+            timestamp: 1000,
+            device_id: "esp32-tx-1".into(),
+            session_id: Some("session-1".into()),
+            event_type: EventType::BufferUnderrun,
+            sequence_number: Some(42),
+            buffer_depth: Some(0),
+            target_depth: Some(3),
+        };
+        let note = store.event(event).expect("note produced");
+        match note {
+            Notification::TelemetryEvent { event, .. } => {
+                assert_eq!(event.event_type, EventType::BufferUnderrun);
+                assert_eq!(event.sequence_number, Some(42));
+                assert_eq!(event.buffer_depth, Some(0));
+                assert_eq!(event.target_depth, Some(3));
+            }
+            _ => panic!("expected TelemetryEvent notification"),
+        }
     }
 }

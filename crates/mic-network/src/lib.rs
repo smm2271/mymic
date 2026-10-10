@@ -270,8 +270,24 @@ async fn run(
                                                      if messages.is_empty(){let _=command.reply.send(Err("empty audio update".into()));continue}
                                                      send(&socket,&messages[0],e.peer).await;e.pending=Some(Pending{messages,position:0,reply:Some(command.reply),sent:Instant::now(),retries:0});
                                                     },
-                                                    deadline=tick.tick()=>{if time::Instant::now().saturating_duration_since(deadline)>Duration::from_millis(20){tick.reset();engine.rebuffer();engine.jitter.metrics.receiver_clock_resets+=1;continue;}
-                if let Some(e)=active.as_ref().and_then(|id|entries.get_mut(id)) && e.device.state==State::Streaming {engine.tick();account_audio(&engine,e,&mut audio_baseline);}},
+                                                    deadline=tick.tick()=>{if time::Instant::now().saturating_duration_since(deadline)>Duration::from_millis(20){tick.reset();engine.rebuffer();engine.jitter.metrics.receiver_clock_resets+=1;if let Some(id)=&active && let Some(e)=entries.get(id){telemetry.event_with_context(&e.device.id,Some(e.session.clone()),EventType::BufferResync,None,Some(engine.jitter.metrics.jitter_buffer_depth),Some(engine.jitter.depth));}continue;}
+                if let Some(e) = active.as_ref().and_then(|id| entries.get_mut(id)) && e.device.state == State::Streaming {
+                    let prev_underruns = engine.jitter.metrics.buffer_underruns;
+                    let prev_overruns = engine.jitter.metrics.buffer_overruns;
+                    let prev_lost = engine.jitter.metrics.lost_packets;
+                    engine.tick();
+                    account_audio(&engine, e, &mut audio_baseline);
+                    if engine.jitter.metrics.buffer_underruns > prev_underruns && prev_underruns.is_multiple_of(10) {
+                        telemetry.event_with_context(&e.device.id, Some(e.session.clone()), EventType::BufferUnderrun, None, Some(engine.jitter.metrics.jitter_buffer_depth), Some(engine.jitter.depth));
+                    }
+                    if engine.jitter.metrics.buffer_overruns > prev_overruns {
+                        telemetry.event_with_context(&e.device.id, Some(e.session.clone()), EventType::BufferOverrun, None, Some(engine.jitter.metrics.jitter_buffer_depth), Some(engine.jitter.depth));
+                    }
+                    if engine.jitter.metrics.lost_packets > prev_lost && prev_lost.is_multiple_of(10) {
+                        telemetry.event_with_context(&e.device.id, Some(e.session.clone()), EventType::DeadlineMiss, None, Some(engine.jitter.metrics.jitter_buffer_depth), Some(engine.jitter.depth));
+                    }
+                }
+            },
                                                     _=maintenance.tick()=>{
                                                      let now=Instant::now();let heartbeat_due=heartbeat.elapsed()>=Duration::from_secs(1);if heartbeat_due{heartbeat=now;}
                                                      for e in entries.values_mut(){
@@ -285,7 +301,7 @@ async fn run(
                         fail(e,"session timeout");e.device.state=State::Offline;if active.as_ref()==Some(&e.device.id){active=None;engine.reset();}}
                                                       if heartbeat_due && matches!(e.device.state,State::Connected|State::Streaming){request=request.wrapping_add(1);let h=control(e,"HEARTBEAT",request);send(&socket,&h,e.peer).await;}
                                                      }
-                                                     telemetry.publish(entries.values().map(|e|DeviceInput{device_id:e.device.id.clone(),session_id:Some(e.session.clone()).filter(|s|!s.is_empty()),connection_state:e.device.state,counters:e.counters,jitter_buffer_depth:if active.as_ref()==Some(&e.device.id){engine.jitter.metrics.jitter_buffer_depth}else{0},activity_epoch:e.activity_epoch,counter_timestamp_ms:Some(counter_clock.elapsed().as_millis() as u64),tx:e.tx.as_ref().filter(|(_,updated,_)|updated.elapsed()<Duration::from_millis(2500)).map(|(t,_,_)|t.clone())}).collect());
+                                                     telemetry.publish(entries.values().map(|e|DeviceInput{device_id:e.device.id.clone(),session_id:Some(e.session.clone()).filter(|s|!s.is_empty()),connection_state:e.device.state,counters:e.counters,jitter_buffer_depth:if active.as_ref()==Some(&e.device.id){engine.jitter.metrics.jitter_buffer_depth}else{0},activity_epoch:e.activity_epoch,counter_timestamp_ms:Some(counter_clock.elapsed().as_millis() as u64),tx:e.tx.as_ref().filter(|(_,updated,_)|updated.elapsed()<Duration::from_millis(2500)).map(|(t,_,_)|t.clone()),rx_inter_arrival_jitter_ms:if active.as_ref()==Some(&e.device.id) && e.device.state==State::Streaming{Some(engine.metrics().inter_arrival_jitter_ms)}else{None},sequence_gaps:if active.as_ref()==Some(&e.device.id){engine.jitter.metrics.sequence_gaps}else{0},late_packet_drops:if active.as_ref()==Some(&e.device.id){engine.jitter.metrics.late_packet_drops}else{0},target_buffer_depth:if active.as_ref()==Some(&e.device.id){engine.jitter.depth}else{0},underrun_fade_outs:if active.as_ref()==Some(&e.device.id){engine.declicker.fade_outs}else{0},recovery_fade_ins:if active.as_ref()==Some(&e.device.id){engine.declicker.fade_ins}else{0}}).collect());
                         let mut snap=snapshot.write().await;snap.devices=entries.values().map(|e|e.device.clone()).collect();snap.devices.sort_by(|a,b|a.id.cmp(&b.id));snap.metrics=engine.metrics();snap.active_device=active.clone();
                                                     }
                                                     }
