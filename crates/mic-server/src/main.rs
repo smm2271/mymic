@@ -226,6 +226,39 @@ async fn history(
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "device telemetry not found".into()))?;
     Ok(Json(json!(history)))
 }
+async fn diagnostics(State(a): State<App>) -> Json<Value> {
+    Json(
+        json!({"continuity":a.core.playback.diagnostics.snapshot(),"capture":a.core.playback.capture.status()}),
+    )
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiagnosticsOptions {
+    enabled: bool,
+}
+async fn diagnostics_options(
+    State(a): State<App>,
+    Json(b): Json<DiagnosticsOptions>,
+) -> Json<Value> {
+    a.core.playback.diagnostics.set_enabled(b.enabled);
+    Json(json!({"ok":true}))
+}
+async fn capture_start(State(a): State<App>) -> ApiResult {
+    let capture = a.core.playback.capture.clone();
+    let status = tokio::task::spawn_blocking(move || capture.start())
+        .await
+        .map_err(bad)?
+        .map_err(core_error)?;
+    Ok(Json(json!(status)))
+}
+async fn capture_stop(State(a): State<App>) -> ApiResult {
+    let capture = a.core.playback.capture.clone();
+    let status = tokio::task::spawn_blocking(move || capture.stop())
+        .await
+        .map_err(bad)?
+        .map_err(core_error)?;
+    Ok(Json(json!(status)))
+}
 async fn events(State(a): State<App>, ws: WebSocketUpgrade) -> Response {
     ws.max_message_size(4096).max_frame_size(4096).on_upgrade(move |mut socket| async move {
   let mut timer=tokio::time::interval(Duration::from_millis(500));
@@ -244,7 +277,9 @@ async fn events(State(a): State<App>, ws: WebSocketUpgrade) -> Response {
     },
     _=timer.tick()=>{
      let snapshot=a.core.snapshot.read().await.clone();
-     let send=socket.send(WsMessage::Text(serde_json::to_string(&snapshot).unwrap().into()));
+     let mut payload=serde_json::to_value(&snapshot).unwrap();
+     payload["diagnostics"]=json!({"continuity":a.core.playback.diagnostics.snapshot(),"capture":a.core.playback.capture.status()});
+     let send=socket.send(WsMessage::Text(payload.to_string().into()));
      if !matches!(tokio::time::timeout(Duration::from_secs(2),send).await,Ok(Ok(()))) {break;}
     },
     message=socket.recv()=>{
@@ -308,6 +343,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/audio/outputs", get(outputs))
         .route("/api/v1/audio/output", put(output))
         .route("/api/v1/metrics", get(metrics))
+        .route(
+            "/api/v1/diagnostics",
+            get(diagnostics).patch(diagnostics_options),
+        )
+        .route("/api/v1/diagnostics/capture/start", post(capture_start))
+        .route("/api/v1/diagnostics/capture/stop", post(capture_stop))
         .route("/api/v1/telemetry/history", get(history))
         .route("/api/v1/events", get(events))
         .fallback_service(tower_http::services::ServeDir::new(

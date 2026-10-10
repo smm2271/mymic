@@ -710,6 +710,7 @@ dependencies = [
  "crossbeam-queue",
  "mic-protocol",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

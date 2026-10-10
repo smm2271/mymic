@@ -1,4 +1,6 @@
+pub mod capture;
 pub mod declick;
+pub mod diagnostics;
 mod sequence;
 use anyhow::{Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -39,8 +41,14 @@ impl Resampler {
     fn next(&mut self, mut input: impl FnMut() -> Option<f32>) -> (f32, bool) {
         let mut short = false;
         if !self.primed {
-            self.a = input().unwrap_or(0.0);
-            self.b = input().unwrap_or(0.0);
+            self.a = input().unwrap_or_else(|| {
+                short = true;
+                0.0
+            });
+            self.b = input().unwrap_or_else(|| {
+                short = true;
+                0.0
+            });
             self.primed = true;
         }
         let sample = self.a + (self.b - self.a) * self.phase as f32;
@@ -105,6 +113,8 @@ pub struct Jitter {
     empty_ticks: u8,
     pub muted: bool,
     pub last_tick_missing: bool,
+    diagnostics: Option<Arc<diagnostics::Diagnostics>>,
+    recovering: bool,
 }
 impl Jitter {
     pub fn new(depth: usize) -> Self {
@@ -122,6 +132,27 @@ impl Jitter {
             empty_ticks: 0,
             muted: false,
             last_tick_missing: false,
+            diagnostics: None,
+            recovering: false,
+        }
+    }
+    fn event(
+        &self,
+        kind: diagnostics::EventType,
+        packet: Option<u32>,
+        expected: Option<u32>,
+        reason: &'static str,
+    ) {
+        if let Some(d) = &self.diagnostics {
+            d.emit(
+                kind,
+                packet,
+                expected,
+                self.packets.len(),
+                self.depth,
+                0,
+                reason,
+            );
         }
     }
     pub fn push(&mut self, p: AudioPacket) {
@@ -141,6 +172,12 @@ impl Jitter {
                     self.expected = Some(p.sequence)
                 } else {
                     self.metrics.late_packet_drops += 1;
+                    self.event(
+                        diagnostics::EventType::LatePacket,
+                        Some(p.sequence),
+                        Some(e),
+                        "behind_playout_cursor",
+                    );
                     return;
                 }
             } else if p.sequence != e.wrapping_add(self.packets.len() as u32) {
@@ -150,6 +187,13 @@ impl Jitter {
             self.expected = Some(p.sequence)
         }
         if self.packets.len() >= 8 {
+            self.event(
+                diagnostics::EventType::BufferResync,
+                Some(p.sequence),
+                self.expected,
+                "jitter_capacity",
+            );
+            self.recovering = true;
             self.metrics.buffer_overruns += 1;
             self.metrics.jitter_buffer_drops += self.packets.len() as u64;
             self.packets.clear();
@@ -160,6 +204,13 @@ impl Jitter {
             .expected
             .is_some_and(|e| p.sequence.wrapping_sub(e) > 100 && ahead(p.sequence, e))
         {
+            self.event(
+                diagnostics::EventType::BufferResync,
+                Some(p.sequence),
+                self.expected,
+                "forward_sequence_jump",
+            );
+            self.recovering = true;
             self.packets.clear();
             self.expected = Some(p.sequence);
             self.started = false;
@@ -180,6 +231,15 @@ impl Jitter {
         let e = self.expected.unwrap();
         self.expected = Some(e.wrapping_add(1));
         let output = if let Some(p) = self.packets.remove(&e) {
+            if self.recovering {
+                self.event(
+                    diagnostics::EventType::AudioRecovery,
+                    Some(e),
+                    Some(e),
+                    "jitter_packet_delivery_resumed",
+                );
+                self.recovering = false;
+            }
             self.last_tick_missing = false;
             self.empty_ticks = 0;
             self.metrics.delivered_packets += 1;
@@ -188,11 +248,28 @@ impl Jitter {
         } else {
             self.last_tick_missing = true;
             self.metrics.lost_packets += 1;
+            self.event(
+                diagnostics::EventType::BufferUnderrun,
+                None,
+                Some(e),
+                if self.muted {
+                    "muted_playout_deadline_missing"
+                } else {
+                    "playout_deadline_missing"
+                },
+            );
+            self.recovering = true;
             if !self.muted {
                 self.metrics.buffer_underruns += 1;
             }
             self.empty_ticks += 1;
             if self.empty_ticks >= 3 && self.packets.is_empty() {
+                self.event(
+                    diagnostics::EventType::BufferResync,
+                    None,
+                    self.expected,
+                    "three_empty_deadlines",
+                );
                 // A stalled sender/scheduler must not leave the playout cursor ahead forever.
                 self.started = false;
                 self.expected = None;
@@ -204,6 +281,7 @@ impl Jitter {
         output
     }
     pub fn reset(&mut self) {
+        self.recovering = false;
         self.packets.clear();
         self.seen.clear();
         self.expected = None;
@@ -238,6 +316,8 @@ pub struct Playback {
     pub channels: Arc<AtomicU64>,
     opened: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
+    pub diagnostics: Arc<diagnostics::Diagnostics>,
+    pub capture: Arc<capture::Capture>,
 }
 impl Playback {
     pub fn outputs() -> Result<Vec<Output>> {
@@ -257,6 +337,8 @@ impl Playback {
     }
     pub fn new() -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Select>(4);
+        let diagnostics = diagnostics::Diagnostics::new();
+        let capture = capture::Capture::new(diagnostics.clone());
         let p = Self {
             queue: Arc::new(ArrayQueue::new(1600)),
             active: Arc::new(AtomicBool::new(false)),
@@ -272,6 +354,8 @@ impl Playback {
             channels: Arc::new(AtomicU64::new(0)),
             opened: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(false)),
+            diagnostics,
+            capture,
         };
         let mut worker = p.clone();
         // The worker must not retain a sender to its own command channel.
@@ -314,6 +398,7 @@ impl Playback {
             .map_err(|e| anyhow!(e))
     }
     pub fn shutdown(&self) {
+        let _ = self.capture.stop();
         let _ = self.select("__shutdown");
     }
     pub fn clear(&self) {
@@ -328,9 +413,19 @@ impl Playback {
             return;
         }
         if self.queue.len() > 960 {
+            self.diagnostics.emit(
+                diagnostics::EventType::BufferResync,
+                None,
+                None,
+                self.diagnostics.depth.load(Ordering::Relaxed) as usize,
+                self.diagnostics.target.load(Ordering::Relaxed) as usize,
+                self.queue.len(),
+                "playback_ring_backlog_clear",
+            );
             self.clear();
             self.overruns.fetch_add(1, Ordering::Relaxed);
         }
+        self.capture.feed(frame);
         for s in frame {
             if self.queue.push(s as f32 / 32768.0).is_err() {
                 self.overruns.fetch_add(1, Ordering::Relaxed);
@@ -376,11 +471,30 @@ impl Playback {
         let output_samples = self.output_samples.clone();
         let starvations = self.callback_starvations.clone();
         let muted = self.muted.clone();
+        let diagnostics = self.diagnostics.clone();
+        let mut recovering = false;
 
-        let mut sampler = Resampler::new(c.sample_rate.0);
+        let error_diagnostics = diagnostics.clone();
+        let output_rate = c.sample_rate.0;
+        let mut previous_callback: Option<(Instant, u64)> = None;
+        let mut sampler = Resampler::new(output_rate);
         Ok(d.build_output_stream(
             c,
             move |data: &mut [T], _| {
+                let now = Instant::now();
+                if let Some((previous, budget)) = previous_callback
+                    && active.load(Ordering::Relaxed)
+                    && sampler.primed
+                {
+                    let gap = now.duration_since(previous).as_micros() as u64;
+                    if gap > budget + 20_000 {
+                        diagnostics.callback_delay(gap, budget, queue.len());
+                    }
+                }
+                previous_callback = Some((
+                    now,
+                    (data.len() / channels) as u64 * 1_000_000 / output_rate as u64,
+                ));
                 output_frames.fetch_add((data.len() / channels) as u64, Ordering::Relaxed);
                 output_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
                 if !active.load(Ordering::Relaxed) || (!sampler.primed && queue.len() < 320) {
@@ -403,14 +517,44 @@ impl Playback {
                     }
                 }
                 if short {
+                    diagnostics.emit(
+                        diagnostics::EventType::AudioCallbackStarvation,
+                        None,
+                        None,
+                        diagnostics.depth.load(Ordering::Relaxed) as usize,
+                        diagnostics.target.load(Ordering::Relaxed) as usize,
+                        queue.len(),
+                        "resampler_input_empty",
+                    );
+                    recovering = true;
                     starvations.fetch_add(1, Ordering::Relaxed);
                     if !muted.load(Ordering::Relaxed) {
                         underruns.fetch_add(1, Ordering::Relaxed);
                     }
                     sampler.reset();
+                } else if recovering {
+                    diagnostics.emit(
+                        diagnostics::EventType::AudioRecovery,
+                        None,
+                        None,
+                        diagnostics.depth.load(Ordering::Relaxed) as usize,
+                        diagnostics.target.load(Ordering::Relaxed) as usize,
+                        queue.len(),
+                        "callback_consumption_resumed",
+                    );
+                    recovering = false;
                 }
             },
             move |e| {
+                error_diagnostics.emit(
+                    diagnostics::EventType::AudioOutputError,
+                    None,
+                    None,
+                    error_diagnostics.depth.load(Ordering::Relaxed) as usize,
+                    error_diagnostics.target.load(Ordering::Relaxed) as usize,
+                    0,
+                    "cpal_output_error_see_output_state",
+                );
                 *state.lock().unwrap() = format!("error: {e}");
             },
             None,
@@ -436,9 +580,12 @@ pub struct Engine {
 }
 impl Engine {
     pub fn new(depth: usize) -> Self {
+        let playback = Playback::new();
+        let mut jitter = Jitter::new(depth);
+        jitter.diagnostics = Some(playback.diagnostics.clone());
         Self {
-            jitter: Jitter::new(depth),
-            playback: Playback::new(),
+            jitter,
+            playback,
             declicker: Declicker::new(),
             started: Instant::now(),
             bytes: 0,
@@ -476,7 +623,21 @@ impl Engine {
         self.sequence
             .observe(p.sequence, self.started.elapsed().as_millis() as u64);
         self.bytes += 320;
-        self.jitter.push(p)
+        self.jitter.push(p);
+        self.update_diagnostic_depth();
+    }
+    fn update_diagnostic_depth(&self) {
+        self.playback
+            .diagnostics
+            .depth
+            .store(self.jitter.packets.len() as u64, Ordering::Relaxed);
+        self.playback
+            .diagnostics
+            .target
+            .store(self.jitter.depth as u64, Ordering::Relaxed);
+    }
+    pub fn set_context(&self, device: &str, session: &str) {
+        self.playback.diagnostics.set_context(device, session);
     }
     pub fn tick(&mut self) {
         self.sequence
@@ -485,6 +646,7 @@ impl Engine {
         self.jitter.metrics.sequence_out_of_order = self.sequence.reordered;
         let was_started = self.jitter.started;
         let f = self.jitter.tick();
+        self.update_diagnostic_depth();
         let smoothed = self.declicker.process(f, self.jitter.last_tick_missing);
         if self.jitter.started || was_started {
             self.playback.feed(smoothed);
@@ -494,14 +656,25 @@ impl Engine {
         self.sequence.reset();
         self.last_arrival = None;
         self.last_timestamp = None;
-        self.rebuffer();
+        self.jitter.reset();
+        self.playback.clear();
+        self.declicker.reset();
+        self.update_diagnostic_depth();
     }
     pub fn set_mute(&mut self, mute: bool) {
         self.jitter.muted = mute;
         self.playback.set_mute(mute);
     }
     pub fn rebuffer(&mut self) {
+        self.jitter.event(
+            diagnostics::EventType::BufferResync,
+            None,
+            self.jitter.expected,
+            "receiver_scheduler_stall",
+        );
         self.jitter.reset();
+        self.jitter.recovering = true;
+        self.update_diagnostic_depth();
         self.playback.clear();
         self.declicker.reset();
     }
@@ -538,6 +711,79 @@ mod tests {
             session: [0; 16],
             samples: [n as i16; 160],
         }
+    }
+    #[test]
+    fn diagnostic_normal_delay_loss_resync_and_disabled_equivalence() {
+        use diagnostics::EventType::*;
+        let d = diagnostics::Diagnostics::bounded(64);
+        let mut j = Jitter::new(2);
+        j.diagnostics = Some(d.clone());
+        j.push(packet(0));
+        j.push(packet(1));
+        for n in 2..20 {
+            j.tick();
+            j.push(packet(n));
+        }
+        assert!(
+            d.queue.is_empty(),
+            "normal playout must not report discontinuities"
+        );
+        j.tick();
+        j.tick();
+        j.tick(); // seq 20 absent at its playout deadline
+        j.push(packet(20)); // delayed packet is behind cursor
+        j.push(packet(21));
+        j.tick(); // recovery
+        j.tick();
+        j.tick();
+        j.tick(); // three empty deadlines -> resync
+        let records = d.drain();
+        for kind in [BufferUnderrun, LatePacket, BufferResync, AudioRecovery] {
+            assert!(
+                records.iter().any(|r| r.event.event_type == kind),
+                "missing {kind:?}"
+            );
+        }
+        let late = records
+            .iter()
+            .find(|r| r.event.event_type == LatePacket)
+            .unwrap();
+        assert_eq!(late.event.packet_sequence, Some(20));
+        assert_eq!(late.event.expected_sequence, Some(21));
+        assert!(
+            records
+                .windows(2)
+                .all(|r| r[0].event.rx_monotonic_us <= r[1].event.rx_monotonic_us)
+        );
+        j.push(packet(22));
+        j.push(packet(23));
+        j.tick();
+        j.push(packet(200));
+        assert!(
+            d.drain()
+                .iter()
+                .any(|r| r.event.reason == "forward_sequence_jump")
+        );
+        for n in 201..210 {
+            j.push(packet(n));
+        }
+        assert!(
+            d.drain()
+                .iter()
+                .any(|r| r.event.reason == "jitter_capacity")
+        );
+        d.set_enabled(false);
+        let mut plain = Jitter::new(2);
+        j.reset();
+        for n in 0..20 {
+            j.push(packet(n));
+            plain.push(packet(n));
+            assert_eq!(j.tick(), plain.tick());
+        }
+        for _ in 0..5 {
+            assert_eq!(j.tick(), plain.tick());
+        }
+        assert!(d.queue.is_empty());
     }
     #[test]
     fn reorder_loss_duplicate() {

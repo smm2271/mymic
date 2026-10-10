@@ -8,3 +8,5 @@ anyhow.workspace = true
 cpal = "0.15.3"
 crossbeam-queue = "0.3"
 mic-protocol = { path = "../mic-protocol" }
+
+serde_json.workspace = true
