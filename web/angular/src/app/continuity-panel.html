@@ -1,0 +1,20 @@
+<section aria-label="Audio Continuity Diagnostics">
+<h2>Audio Continuity Diagnostics</h2>
+<p>RX 全域統計 · 同一單調時鐘 · 使用既有 WebSocket 更新</p>
+<label><input type="checkbox" [ngModel]="data.continuity.enabled" (ngModelChange)="enabledChange.emit($event)" [disabled]="disabled">啟用事件紀錄</label>
+<p>診斷事件 Drop Count：{{data.continuity.drop_count}}。累積次數包含丟棄事件；最近 60 秒為成功入列事件的秒窗口統計。</p>
+<table><thead><tr><th>事件</th><th>累積</th><th>最近 60 秒</th></tr></thead><tbody>
+@for(type of data.continuity.event_types;track type;let i=$index){<tr><td>{{type}}</td><td>{{data.continuity.counts[i]}}</td><td>{{data.continuity.counts_60s[i]}}</td></tr>}
+</tbody></table>
+<p>事件檔案：{{data.continuity.event_log_path||'首個事件發生後建立'}}</p>
+@if(data.continuity.event_log_error){<p class="warning" role="alert">{{data.continuity.event_log_error}}</p>}
+<button (click)="captureRequested.emit(true)" [disabled]="disabled||data.capture.active">開始 WAV（最多 30 秒）</button>
+<button (click)="captureRequested.emit(false)" [disabled]="disabled||!data.capture.active">停止錄製</button>
+<p>WAV：{{data.capture.active?'錄製中':'停止'}} · {{(data.capture.samples/16000).toFixed(2)}} 秒 · Dropped frames {{data.capture.dropped_frames}} · {{data.capture.reason||'尚未錄製'}}</p>
+<p>{{data.capture.path||'Diagnostics 目錄'}} · 開始／結束 RX µs：{{data.capture.started_monotonic_us??'—'}} / {{data.capture.ended_monotonic_us??'—'}}</p>
+@if(data.capture.error){<p class="warning" role="alert">{{data.capture.error}}</p>}
+<p>擷取 de-click 後、播放佇列與裝置重取樣前的 PCM S16LE / Mono / 16 kHz；不是 Windows loopback。Callback 補零與装置端異常需搭配事件分析。depth 以封包計，ring 以 16 kHz sample 計。</p>
+<details open><summary>最近事件（最多顯示 20 筆）</summary><ul>
+@for(record of data.continuity.recent.slice(-20);track $index){<li><time>RX {{record.rx_monotonic_us}} µs</time> · {{record.event_type}} · {{record.device_id||'未設定裝置'}} / stream {{record.stream_id}} · seq {{record.packet_sequence??'—'}} / expected {{record.expected_sequence??'—'}} · depth {{record.jitter_buffer_depth}} / {{record.target_buffer_depth}} · ring {{record.ring_depth_samples}} · {{record.reason}} @if(record.callback_interval_us!=null){ · Callback gap {{record.callback_interval_us}} µs / budget {{record.callback_budget_us}} µs }</li>}
+</ul></details>
+</section>

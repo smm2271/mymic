@@ -1,11 +1,14 @@
+import { ContinuityPanel } from './continuity-panel';
 import { Component, signal, OnDestroy } from '@angular/core';
+import { emptyDiagnostics, DiagnosticsSnapshot } from './continuity-model';
 import { FormsModule } from '@angular/forms';
 import { TelemetryChart } from './telemetry-chart';
 import { History,HistoryState,TelemetrySnapshot,TelemetryEvent,emptyHistory,restoreHistory,appendSnapshot,appendEvent,loss60 } from './history-model';
 interface Device { id:string; name:string; device_type:string; address:string; state:string; capabilities:string[]; source:string; gain:number; mute:boolean; last_error:string|null }
 interface Output {id:string;name:string;is_default:boolean}
-@Component({selector:'app-root',imports:[FormsModule,TelemetryChart],templateUrl:'./app.html',styleUrl:'./app.css'})
+@Component({selector:'app-root',imports:[FormsModule,TelemetryChart,ContinuityPanel],templateUrl:'./app.html',styleUrl:'./app.css'})
 export class App implements OnDestroy {
+ readonly diagnostics=signal<DiagnosticsSnapshot>(emptyDiagnostics());
  readonly online=signal(false);readonly error=signal('');readonly devices=signal<Device[]>([]);readonly outputs=signal<Output[]>([]);readonly metrics=signal<Record<string,any>>({});readonly busy=signal('');readonly socketState=signal('連線中');
  readonly history=signal<HistoryState>(emptyHistory());readonly historyError=signal('');readonly loadingHistory=signal(false);readonly selectedDevice=signal('');readonly range=signal('60s');readonly chartTimezone=signal<'local'|'utc'>('local');private historyRequest=0;
  readonly charts=[{field:'packet_loss_rate' as const,title:'播放期限缺包率（非 UDP 遺失）',unit:'%',color:'#ecad75'},{field:'receive_bitrate' as const,title:'每秒 PCM Payload 接收速率',unit:'kbps',color:'#68c9b4'},{field:'jitter_buffer_depth' as const,title:'Jitter Buffer Depth',unit:'封包',color:'#90b1ff'},{field:'buffer_underruns_per_second' as const,title:'Buffer Underruns',unit:'次／秒',color:'#dc94c9'},{field:'rx_packet_rate' as const,title:'TX / RX 封包率對照',unit:'packets/s',color:'#68c9b4'},{field:'tx_scheduling_drift_ms' as const,title:'TX Scheduling Drift（Simulator-only）',unit:'ms',color:'#90b1ff'},{field:'rx_inter_arrival_jitter_ms' as const,title:'RX 到達抖動（Inter-arrival Jitter）',unit:'ms',color:'#7ee787'}];
@@ -34,7 +37,7 @@ export class App implements OnDestroy {
    if(snapshot.device_id===this.selectedDevice()&&old.streamId&&old.streamId!==message.stream_id)void this.loadHistory();
   }else if(message.kind==='telemetry_event'){this.history.set(appendEvent(this.history(),message.stream_id,message.event as TelemetryEvent));}
   else if(message.kind==='resync_required'){void this.loadHistory();}
-  else if(Array.isArray(message.devices)){this.devices.set(message.devices);this.metrics.set(message.metrics);this.ensureSelection();}
+  else if(Array.isArray(message.devices)){this.devices.set(message.devices);this.metrics.set(message.metrics);if(message.diagnostics)this.diagnostics.set(message.diagnostics);this.ensureSelection();}
  }
  async loadHistory(){
   const id=this.selectedDevice();if(!id)return;
@@ -55,5 +58,7 @@ export class App implements OnDestroy {
  targetDepth():string{const d=this.latest()?.target_buffer_depth;return d==null?'—':String(d);}
  isEsp32():boolean{return this.selectedDevice().startsWith('esp32');}
  utc(timestamp:number|undefined){return timestamp===undefined?'—':new Date(timestamp).toISOString();}
+ capture(start:boolean){void this.action('capture',`/diagnostics/capture/${start?'start':'stop'}`,{});}
+ setDiagnostics(enabled:boolean){void this.action('diagnostics','/diagnostics',{enabled},'PATCH');}
  ngOnDestroy(){this.destroyed=true;clearTimeout(this.timer);this.socket?.close();}
 }
