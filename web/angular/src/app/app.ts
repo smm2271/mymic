@@ -8,7 +8,7 @@ interface Output {id:string;name:string;is_default:boolean}
 export class App implements OnDestroy {
  readonly online=signal(false);readonly error=signal('');readonly devices=signal<Device[]>([]);readonly outputs=signal<Output[]>([]);readonly metrics=signal<Record<string,any>>({});readonly busy=signal('');readonly socketState=signal('連線中');
  readonly history=signal<HistoryState>(emptyHistory());readonly historyError=signal('');readonly loadingHistory=signal(false);readonly selectedDevice=signal('');readonly range=signal('60s');readonly chartTimezone=signal<'local'|'utc'>('local');private historyRequest=0;
- readonly charts=[{field:'packet_loss_rate' as const,title:'播放期限缺包率（非 UDP 遺失）',unit:'%',color:'#ecad75'},{field:'receive_bitrate' as const,title:'每秒 PCM Payload 接收速率',unit:'kbps',color:'#68c9b4'},{field:'jitter_buffer_depth' as const,title:'Jitter Buffer Depth',unit:'封包',color:'#90b1ff'},{field:'buffer_underruns_per_second' as const,title:'Buffer Underruns',unit:'次／秒',color:'#dc94c9'},{field:'rx_packet_rate' as const,title:'TX / RX 封包率對照',unit:'packets/s',color:'#68c9b4'},{field:'tx_scheduling_drift_ms' as const,title:'TX Scheduling Drift（Simulator-only）',unit:'ms',color:'#90b1ff'}];
+ readonly charts=[{field:'packet_loss_rate' as const,title:'播放期限缺包率（非 UDP 遺失）',unit:'%',color:'#ecad75'},{field:'receive_bitrate' as const,title:'每秒 PCM Payload 接收速率',unit:'kbps',color:'#68c9b4'},{field:'jitter_buffer_depth' as const,title:'Jitter Buffer Depth',unit:'封包',color:'#90b1ff'},{field:'buffer_underruns_per_second' as const,title:'Buffer Underruns',unit:'次／秒',color:'#dc94c9'},{field:'rx_packet_rate' as const,title:'TX / RX 封包率對照',unit:'packets/s',color:'#68c9b4'},{field:'tx_scheduling_drift_ms' as const,title:'TX Scheduling Drift（Simulator-only）',unit:'ms',color:'#90b1ff'},{field:'rx_inter_arrival_jitter_ms' as const,title:'RX 到達抖動（Inter-arrival Jitter）',unit:'ms',color:'#7ee787'}];
  code:Record<string,string>={};output='default';private token='';private socket?:WebSocket;private timer?:ReturnType<typeof setTimeout>;private destroyed=false;
  private readonly base=location.port==='4200'?'http://127.0.0.1:8080':'';
  readonly labels:Record<string,string>={OFFLINE:'離線',DISCOVERED:'待配對',PAIRING:'配對中',CONNECTED:'已連線',STREAMING:'串流中'};
@@ -51,6 +51,9 @@ export class App implements OnDestroy {
  loss():string{const rate=loss60(this.history());return rate===null?'—':rate.toFixed(2);}
  rate():string{const rate=this.latest()?.receive_bitrate;return rate==null?'—':(rate/1000).toFixed(1);}
  totalLoss():string{const counters=this.latest()?.cumulative;if(!counters||counters.received_packets+counters.lost_packets===0)return '—';return (100*counters.lost_packets/(counters.received_packets+counters.lost_packets)).toFixed(2);}
+ rxJitter():string{const j=this.latest()?.rx_inter_arrival_jitter_ms;return j==null?'—':j.toFixed(2);}
+ targetDepth():string{const d=this.latest()?.target_buffer_depth;return d==null?'—':String(d);}
+ isEsp32():boolean{return this.selectedDevice().startsWith('esp32');}
  utc(timestamp:number|undefined){return timestamp===undefined?'—':new Date(timestamp).toISOString();}
  ngOnDestroy(){this.destroyed=true;clearTimeout(this.timer);this.socket?.close();}
 }
