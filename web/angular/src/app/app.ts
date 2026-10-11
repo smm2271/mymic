@@ -1,3 +1,5 @@
+import { AudioLab } from './audio-lab';
+import { LabConfig } from './audio-lab-model';
 import { ContinuityPanel } from './continuity-panel';
 import { Component, signal, OnDestroy } from '@angular/core';
 import { emptyDiagnostics, DiagnosticsSnapshot } from './continuity-model';
@@ -6,8 +8,10 @@ import { TelemetryChart } from './telemetry-chart';
 import { History,HistoryState,TelemetrySnapshot,TelemetryEvent,emptyHistory,restoreHistory,appendSnapshot,appendEvent,loss60 } from './history-model';
 interface Device { id:string; name:string; device_type:string; address:string; state:string; capabilities:string[]; source:string; gain:number; mute:boolean; last_error:string|null }
 interface Output {id:string;name:string;is_default:boolean}
-@Component({selector:'app-root',imports:[FormsModule,TelemetryChart,ContinuityPanel],templateUrl:'./app.html',styleUrl:'./app.css'})
+@Component({selector:'app-root',imports:[FormsModule,TelemetryChart,ContinuityPanel,AudioLab],templateUrl:'./app.html',styleUrl:'./app.css'})
 export class App implements OnDestroy {
+ readonly labSnapshot=signal<any>({});readonly buildVersion=signal('unknown');
+ readonly applyLab=async(id:string,c:LabConfig)=>{await this.request(`/devices/${id}/transport`,'PUT',c);};
  readonly diagnostics=signal<DiagnosticsSnapshot>(emptyDiagnostics());
  readonly online=signal(false);readonly error=signal('');readonly devices=signal<Device[]>([]);readonly outputs=signal<Output[]>([]);readonly metrics=signal<Record<string,any>>({});readonly busy=signal('');readonly socketState=signal('連線中');
  readonly history=signal<HistoryState>(emptyHistory());readonly historyError=signal('');readonly loadingHistory=signal(false);readonly selectedDevice=signal('');readonly range=signal('60s');readonly chartTimezone=signal<'local'|'utc'>('local');private historyRequest=0;
@@ -18,7 +22,7 @@ export class App implements OnDestroy {
  readonly sources=[{id:'sine',name:'440 Hz 正弦波'},{id:'sweep',name:'頻率掃描'},{id:'pulse',name:'脈衝'},{id:'silence',name:'靜音訊號'}];
  constructor(){void this.connect();}
  private async request(path:string,method='GET',body?:unknown){const r=await fetch(this.base+'/api/v1'+path,{method,headers:{'Content-Type':'application/json','X-Mic-Token':this.token},...(body===undefined?{}:{body:JSON.stringify(body)})});const data=await r.json();if(!r.ok)throw new Error(data.error?.message||`HTTP ${r.status}`);return data;}
- private async connect(){if(this.destroyed)return;try{const status=await this.request('/status');this.token=status.api_token;this.devices.set(await this.request('/devices'));this.ensureSelection();this.outputs.set(await this.request('/audio/outputs'));this.online.set(true);this.error.set('');const origin=this.base||location.origin;this.socket=new WebSocket(origin.replace(/^http/,'ws')+'/api/v1/events');this.socket.onopen=()=>{this.socketState.set('即時同步');void this.loadHistory();};this.socket.onmessage=(e)=>this.onMessage(JSON.parse(e.data));this.socket.onclose=()=>{this.online.set(false);this.socketState.set('連線中斷，正在重試');this.retry();};this.socket.onerror=()=>this.socket?.close();}catch(e){this.online.set(false);this.error.set('Rust 服務無法連線：'+String(e));this.retry();}}
+ private async connect(){if(this.destroyed)return;try{const status=await this.request('/status');this.token=status.api_token;this.buildVersion.set(`${status.build_version} ${status.build_commit} dirty=${status.build_dirty}`);this.devices.set(await this.request('/devices'));this.ensureSelection();this.outputs.set(await this.request('/audio/outputs'));this.online.set(true);this.error.set('');const origin=this.base||location.origin;this.socket=new WebSocket(origin.replace(/^http/,'ws')+'/api/v1/events');this.socket.onopen=()=>{this.socketState.set('即時同步');void this.loadHistory();};this.socket.onmessage=(e)=>this.onMessage(JSON.parse(e.data));this.socket.onclose=()=>{this.online.set(false);this.socketState.set('連線中斷，正在重試');this.retry();};this.socket.onerror=()=>this.socket?.close();}catch(e){this.online.set(false);this.error.set('Rust 服務無法連線：'+String(e));this.retry();}}
  private retry(){if(!this.destroyed){clearTimeout(this.timer);this.timer=setTimeout(()=>void this.connect(),2000);}}
  async action(id:string,path:string,body:unknown,method='POST'){this.busy.set(id);this.error.set('');try{await this.request(path,method,body);}catch(e){this.error.set(String(e));}finally{this.busy.set('');}}
  pair(d:Device){void this.action(d.id,`/devices/${d.id}/pair`,{code:(this.code[d.id]||'').trim()});this.code[d.id]='';}
@@ -37,7 +41,7 @@ export class App implements OnDestroy {
    if(snapshot.device_id===this.selectedDevice()&&old.streamId&&old.streamId!==message.stream_id)void this.loadHistory();
   }else if(message.kind==='telemetry_event'){this.history.set(appendEvent(this.history(),message.stream_id,message.event as TelemetryEvent));}
   else if(message.kind==='resync_required'){void this.loadHistory();}
-  else if(Array.isArray(message.devices)){this.devices.set(message.devices);this.metrics.set(message.metrics);if(message.diagnostics)this.diagnostics.set(message.diagnostics);this.ensureSelection();}
+  else if(Array.isArray(message.devices)){this.labSnapshot.set(message);this.devices.set(message.devices);this.metrics.set(message.metrics);if(message.diagnostics)this.diagnostics.set(message.diagnostics);this.ensureSelection();}
  }
  async loadHistory(){
   const id=this.selectedDevice();if(!id)return;

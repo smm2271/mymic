@@ -6,7 +6,7 @@
     "start": "ng serve",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
-    "test": "node --experimental-strip-types ../../tests/history-model.mjs"
+    "test": "node --experimental-strip-types ../../tests/history-model.mjs && node --experimental-strip-types ../../tests/audio-lab-model.mjs"
   },
   "private": true,
   "packageManager": "npm@11.16.0",
