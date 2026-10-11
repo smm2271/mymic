@@ -8,6 +8,8 @@ mod continuity_regression;
 pub mod declick;
 pub mod diagnostics;
 mod drift;
+#[cfg(test)]
+mod lab_tests;
 mod output;
 mod sequence;
 use anyhow::{Result, anyhow};
@@ -83,6 +85,7 @@ impl CallbackMonitor {
     }
 }
 use mic_protocol::{AudioPacket, ahead};
+pub mod fec;
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -169,6 +172,11 @@ impl Resampler {
 }
 #[derive(Default, Clone, Serialize, Debug)]
 pub struct Metrics {
+    pub authenticated_audio_packets: u64,
+    pub authenticated_pcm_bytes: u64,
+    pub jitter_capacity_packets: usize,
+    pub actual_buffered_ms: usize,
+    pub contiguous_playable_ms: usize,
     pub output_diagnostics: output::OutputSnapshot,
     pub rx_authenticated_packet_age_ms: Option<f64>,
     pub jitter_missing_samples_fed: u64,
@@ -183,6 +191,7 @@ pub struct Metrics {
     pub invalid_packets: u64,
     pub output_state: String,
     pub received_datagrams: u64,
+    pub received_datagram_bytes: u64,
     pub sequence_gaps: u64,
     pub sequence_out_of_order: u64,
     pub rejected_packets: u64,
@@ -243,6 +252,8 @@ impl IsolationOptions {
     }
 }
 pub struct Jitter {
+    pub frame_samples: usize,
+    pub capacity: usize,
     capacity_policy: bool,
     packets: HashMap<u32, AudioPacket>,
     expected: Option<u32>,
@@ -260,6 +271,8 @@ impl Jitter {
     pub fn new(depth: usize) -> Self {
         let depth = depth.clamp(2, 4);
         Self {
+            frame_samples: 160,
+            capacity: 8,
             capacity_policy: true,
             packets: HashMap::new(),
             expected: None,
@@ -340,7 +353,7 @@ impl Jitter {
             o.occupancy = Some(self.occupancy());
             o.occupancy_before = Some(before);
             o.contiguous_depth = Some(self.contiguous_playable_depth());
-            o.capacity = Some(8);
+            o.capacity = Some(self.capacity);
             o.late_packet_count = Some(self.metrics.late_packet_drops);
             o.underrun_count = Some(self.metrics.buffer_underruns);
             o.admitted = Some(self.metrics.accepted_packets > accepted);
@@ -361,7 +374,7 @@ impl Jitter {
             let distance = p.sequence.wrapping_sub(e);
             if ahead(e, p.sequence) {
                 self.metrics.out_of_order_packets += 1;
-                if !self.started && e.wrapping_sub(p.sequence) < 8 {
+                if !self.started && e.wrapping_sub(p.sequence) < self.capacity as u32 {
                     self.expected = Some(p.sequence);
                 } else {
                     self.metrics.late_packet_drops += 1;
@@ -390,7 +403,7 @@ impl Jitter {
         } else {
             self.expected = Some(p.sequence);
         }
-        if self.packets.len() >= 8 {
+        if self.packets.len() >= self.capacity {
             let expected = self.expected.unwrap();
             let farthest = *self
                 .packets
@@ -440,7 +453,7 @@ impl Jitter {
         if let Some(e) = self.expected {
             if ahead(e, p.sequence) {
                 self.metrics.out_of_order_packets += 1;
-                if !self.started && e.wrapping_sub(p.sequence) < 8 {
+                if !self.started && e.wrapping_sub(p.sequence) < self.capacity as u32 {
                     self.expected = Some(p.sequence)
                 } else {
                     self.metrics.late_packet_drops += 1;
@@ -458,7 +471,7 @@ impl Jitter {
         } else {
             self.expected = Some(p.sequence)
         }
-        if self.packets.len() >= 8 {
+        if self.packets.len() >= self.capacity {
             self.event(
                 diagnostics::EventType::BufferResync,
                 Some(p.sequence),
@@ -504,7 +517,7 @@ impl Jitter {
             o.occupancy = Some(self.occupancy());
             o.occupancy_before = Some(before);
             o.contiguous_depth = Some(self.contiguous_playable_depth());
-            o.capacity = Some(8);
+            o.capacity = Some(self.capacity);
             o.late_packet_count = Some(self.metrics.late_packet_drops);
             o.underrun_count = Some(self.metrics.buffer_underruns);
             o.delivered = Some(self.metrics.delivered_packets > delivered);
@@ -537,7 +550,7 @@ impl Jitter {
             self.last_tick_missing = false;
             self.empty_ticks = 0;
             self.metrics.delivered_packets += 1;
-            self.metrics.delivered_samples += 160;
+            self.metrics.delivered_samples += self.frame_samples as u64;
             p.samples
         } else {
             self.last_tick_missing = true;
@@ -733,6 +746,9 @@ impl Playback {
         self.feed_tagged(frame, false);
     }
     fn feed_tagged(&self, frame: [i16; 160], upstream_faded: bool) {
+        self.feed_frame(frame, upstream_faded, 160);
+    }
+    fn feed_frame(&self, frame: [i16; 160], upstream_faded: bool, samples: usize) {
         if !self.opened.load(Ordering::Relaxed) {
             return;
         }
@@ -749,14 +765,14 @@ impl Playback {
             self.clear();
             self.overruns.fetch_add(1, Ordering::Relaxed);
         }
-        self.capture.feed(frame);
+        self.capture.feed_frame(frame, samples);
         let epoch = self.epoch.load(Ordering::Acquire);
         let mut dropped = 0;
-        for s in frame {
+        for s in &frame[..samples] {
             if self
                 .queue
                 .push(output::Input {
-                    value: s as f32 / 32768.0,
+                    value: *s as f32 / 32768.0,
                     upstream_faded,
                     epoch,
                 })
@@ -772,7 +788,7 @@ impl Playback {
         o.capacity = Some(self.queue.capacity());
         if self.diagnostics.drift_enabled {
             o.output_epoch = Some(epoch);
-            o.accepted_samples = Some(160 - dropped);
+            o.accepted_samples = Some(samples as u64 - dropped);
             o.dropped_samples = Some(dropped);
         }
         self.diagnostics.observe(o);
@@ -904,6 +920,7 @@ impl Default for Playback {
     }
 }
 pub struct Engine {
+    authenticated_audio_packets: u64,
     pub jitter: Jitter,
     pub playback: Playback,
     pub declicker: Declicker,
@@ -927,6 +944,7 @@ impl Engine {
         jitter.diagnostics = Some(playback.diagnostics.clone());
         Self {
             jitter,
+            authenticated_audio_packets: 0,
             playback,
             declicker: Declicker::new(),
             started: Instant::now(),
@@ -941,6 +959,12 @@ impl Engine {
     }
     pub fn inter_arrival_jitter_ms(&self) -> f64 {
         self.inter_arrival_jitter_ms
+    }
+    pub fn authenticated_audio_packets(&self) -> u64 {
+        self.authenticated_audio_packets
+    }
+    pub fn authenticated_pcm_bytes(&self) -> u64 {
+        self.bytes
     }
     pub fn target_buffer_depth(&self) -> usize {
         self.jitter.depth
@@ -957,6 +981,7 @@ impl Engine {
     }
     /// Timestamp at socket receive completion, before authentication/decode work.
     pub fn receive_at(&mut self, p: AudioPacket, arrival_us: u64) {
+        self.authenticated_audio_packets += 1;
         let now = Instant::now();
         if let (Some(prev_time), Some(prev_ts)) = (self.last_arrival, self.last_timestamp) {
             let delta_ms = now.duration_since(prev_time).as_secs_f64() * 1000.0;
@@ -988,7 +1013,7 @@ impl Engine {
         o.duplicate = Some(self.sequence.duplicates > duplicates);
         d.observe(o);
         self.diagnostic_arrival_us = Some(arrival_us);
-        self.bytes += 320;
+        self.bytes += (self.jitter.frame_samples * 2) as u64;
         self.jitter.push(p);
         self.update_diagnostic_depth();
     }
@@ -1001,6 +1026,23 @@ impl Engine {
             .diagnostics
             .target
             .store(self.jitter.depth as u64, Ordering::Relaxed);
+    }
+    /// Called only while stopped, before a fresh START epoch.
+    pub fn configure_transport(
+        &mut self,
+        config: mic_protocol::lab::TransportConfig,
+        negotiated: bool,
+    ) {
+        self.reset();
+        self.jitter.frame_samples = config.samples();
+        self.jitter.depth = config.depth();
+        // Baseline remains 8 packets. Lab capacity is a separate 160 ms bound.
+        self.jitter.capacity = if negotiated {
+            160 / config.frame_duration_ms as usize
+        } else {
+            8
+        };
+        self.update_diagnostic_depth();
     }
     pub fn set_context(&self, device: &str, session: &str) {
         self.playback.diagnostics.set_context(device, session);
@@ -1018,12 +1060,17 @@ impl Engine {
         let f = self.jitter.tick();
         self.update_diagnostic_depth();
         let upstream_faded = self.jitter.last_tick_missing || self.declicker.in_underrun;
-        let smoothed = self.declicker.process(f, self.jitter.last_tick_missing);
+        let smoothed = self.declicker.process_frame(
+            f,
+            self.jitter.last_tick_missing,
+            self.jitter.frame_samples,
+        );
         if self.jitter.started || was_started {
             if self.jitter.last_tick_missing {
-                self.jitter.metrics.jitter_missing_samples_fed += 160;
+                self.jitter.metrics.jitter_missing_samples_fed += self.jitter.frame_samples as u64;
             }
-            self.playback.feed_tagged(smoothed, upstream_faded);
+            self.playback
+                .feed_frame(smoothed, upstream_faded, self.jitter.frame_samples);
         }
     }
     pub fn reset(&mut self) {
@@ -1058,6 +1105,8 @@ impl Engine {
     }
     pub fn metrics(&self) -> Metrics {
         let mut m = self.jitter.metrics.clone();
+        m.authenticated_audio_packets = self.authenticated_audio_packets;
+        m.authenticated_pcm_bytes = self.bytes;
         m.output_diagnostics = self.playback.output_diagnostics.snapshot();
         m.rx_authenticated_packet_age_ms = self
             .last_arrival
@@ -1074,6 +1123,10 @@ impl Engine {
         m.ring_depth_samples = self.playback.queue.len();
         m.output_sample_rate = self.playback.sample_rate.load(Ordering::Relaxed);
         m.output_channels = self.playback.channels.load(Ordering::Relaxed);
+        m.jitter_capacity_packets = self.jitter.capacity;
+        m.actual_buffered_ms = self.jitter.occupancy() * self.jitter.frame_samples / 16;
+        m.contiguous_playable_ms =
+            self.jitter.contiguous_playable_depth() * self.jitter.frame_samples / 16;
         m.target_buffer_depth = self.jitter.depth;
         m.contiguous_playable_depth = self.jitter.contiguous_playable_depth();
         m.underrun_fade_outs = self.declicker.fade_outs;

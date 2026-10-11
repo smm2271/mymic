@@ -21,8 +21,14 @@ pub enum EventType {
     AudioCallbackStarvation,
     AudioCallbackDelay,
     AudioOutputError,
+    FecRecovered,
+    FecUnrecoverable,
+    FecTooLate,
+    FecParityReceived,
+    TransportConfigApplied,
+    TransportConfigRejected,
 }
-pub const EVENT_TYPES: [EventType; 7] = [
+pub const EVENT_TYPES: [EventType; 13] = [
     EventType::BufferUnderrun,
     EventType::LatePacket,
     EventType::BufferResync,
@@ -30,9 +36,17 @@ pub const EVENT_TYPES: [EventType; 7] = [
     EventType::AudioCallbackStarvation,
     EventType::AudioCallbackDelay,
     EventType::AudioOutputError,
+    EventType::FecRecovered,
+    EventType::FecUnrecoverable,
+    EventType::FecTooLate,
+    EventType::FecParityReceived,
+    EventType::TransportConfigApplied,
+    EventType::TransportConfigRejected,
 ];
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Event {
+    pub deadline_sequence: Option<u32>,
+    pub playout_epoch: u64,
     pub event_type: EventType,
     pub rx_monotonic_us: u64,
     pub stream_id: u64,
@@ -111,8 +125,8 @@ pub struct Snapshot {
     pub current_session_id: Option<String>,
     pub enabled: bool,
     pub enabled_changes: u64,
-    pub counts: [u64; 7],
-    pub counts_60s: [u64; 7],
+    pub counts: [u64; 13],
+    pub counts_60s: [u64; 13],
     pub event_types: Vec<EventType>,
     pub drop_count: u64,
     pub observation_drop_count: u64,
@@ -126,7 +140,7 @@ pub struct Snapshot {
 #[derive(Default)]
 struct State {
     recent: VecDeque<Record>,
-    buckets: BTreeMap<u64, [u64; 7]>,
+    buckets: BTreeMap<u64, [u64; 13]>,
     path: Option<String>,
     error: Option<String>,
     manifest: Option<String>,
@@ -144,7 +158,7 @@ pub struct Diagnostics {
     enabled: AtomicBool,
     enabled_changes: AtomicU64,
     drops: AtomicU64,
-    counts: [AtomicU64; 7],
+    counts: [AtomicU64; 13],
     pub(crate) stream: AtomicU64,
     contexts: Mutex<BTreeMap<u64, (String, String)>>,
     state: Mutex<State>,
@@ -267,6 +281,9 @@ impl Diagnostics {
         drop(contexts);
         self.observe(self.observation("stream_start"));
     }
+    pub fn current_stream_id(&self) -> u64 {
+        self.stream.load(Ordering::Acquire)
+    }
     #[allow(clippy::too_many_arguments)] // Fixed scalar RT payload; no allocation or locking.
     pub fn emit(
         &self,
@@ -278,11 +295,29 @@ impl Diagnostics {
         ring: Option<usize>,
         reason: &'static str,
     ) {
+        self.emit_deadline(
+            event_type, packet, expected, depth, target, ring, reason, None,
+        );
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_deadline(
+        &self,
+        event_type: EventType,
+        packet: Option<u32>,
+        expected: Option<u32>,
+        depth: usize,
+        target: usize,
+        ring: Option<usize>,
+        reason: &'static str,
+        deadline_sequence: Option<u32>,
+    ) {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
         self.counts[event_type as usize].fetch_add(1, Ordering::Relaxed);
         let event = Event {
+            playout_epoch: self.playout_epoch.load(Ordering::Relaxed),
+            deadline_sequence,
             event_type,
             rx_monotonic_us: self.now_us(),
             stream_id: self.stream.load(Ordering::Acquire),
@@ -305,6 +340,8 @@ impl Diagnostics {
         }
         self.counts[EventType::AudioCallbackDelay as usize].fetch_add(1, Ordering::Relaxed);
         let event = Event {
+            playout_epoch: self.playout_epoch.load(Ordering::Relaxed),
+            deadline_sequence: None,
             event_type: EventType::AudioCallbackDelay,
             rx_monotonic_us: self.now_us(),
             stream_id: self.stream.load(Ordering::Acquire),
@@ -393,9 +430,9 @@ impl Diagnostics {
             .cloned();
         let state = self.state.lock().unwrap();
         let now = self.now_us();
-        let mut counts_60s = [0; 7];
+        let mut counts_60s = [0; 13];
         for (_, counts) in state.buckets.range((now / 1_000_000).saturating_sub(59)..) {
-            for i in 0..7 {
+            for i in 0..13 {
                 counts_60s[i] += counts[i];
             }
         }

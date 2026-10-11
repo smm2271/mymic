@@ -25,6 +25,15 @@ impl Declicker {
     /// Process a 160-sample frame.
     /// `is_missing` indicates whether this frame slot suffered a playout deadline miss / underrun.
     pub fn process(&mut self, frame: [i16; 160], is_missing: bool) -> [i16; 160] {
+        self.process_frame(frame, is_missing, 160)
+    }
+    pub fn process_frame(
+        &mut self,
+        frame: [i16; 160],
+        is_missing: bool,
+        samples: usize,
+    ) -> [i16; 160] {
+        assert!(matches!(samples, 80 | 160));
         let mut out = frame;
         if is_missing {
             if !self.in_underrun {
@@ -37,7 +46,7 @@ impl Declicker {
                         let val = (self.last_sample as f64 * w).round();
                         *out_sample = val.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
                     }
-                    out[FADE_SAMPLES..160].fill(0);
+                    out[FADE_SAMPLES..].fill(0);
                     self.last_sample = 0;
                     return out;
                 }
@@ -58,7 +67,7 @@ impl Declicker {
             }
         }
 
-        self.last_sample = out[159];
+        self.last_sample = out[samples - 1];
         out
     }
 }

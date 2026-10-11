@@ -45,6 +45,7 @@ pub struct Status {
 }
 #[derive(Clone, Copy)]
 struct Frame {
+    sample_count: usize,
     generation: u64,
     timestamp_us: u64,
     stream: u64,
@@ -187,11 +188,15 @@ impl Capture {
             .map_err(|e| e.to_string())?
     }
     pub fn feed(&self, samples: [i16; 160]) {
+        self.feed_frame(samples, 160);
+    }
+    pub fn feed_frame(&self, samples: [i16; 160], sample_count: usize) {
         let generation = self.active.load(Ordering::Acquire);
         if generation == 0 {
             return;
         }
         let frame = Frame {
+            sample_count,
             generation,
             timestamp_us: self.diagnostics.now_us(),
             stream: self.diagnostics.stream.load(Ordering::Acquire),
@@ -275,7 +280,7 @@ impl Capture {
                 continue;
             }
             drop(state);
-            let result = r.writer.append(&frame.samples);
+            let result = r.writer.append(&frame.samples[..frame.sample_count]);
             let mut state = self.state.lock().unwrap();
             match result {
                 Ok(()) => {
@@ -283,7 +288,7 @@ impl Capture {
                         sample_offset: state.samples,
                         rx_monotonic_us: frame.timestamp_us,
                     });
-                    state.samples += 160;
+                    state.samples += frame.sample_count as u32;
                     state
                         .first_frame_monotonic_us
                         .get_or_insert(frame.timestamp_us);
@@ -342,13 +347,13 @@ impl Wav {
         file.write_all(&header(0))?;
         Ok(Self { file, samples: 0 })
     }
-    fn append(&mut self, samples: &[i16; 160]) -> std::io::Result<()> {
+    fn append(&mut self, samples: &[i16]) -> std::io::Result<()> {
         let mut bytes = [0; 320];
         for (i, sample) in samples.iter().enumerate() {
             bytes[2 * i..2 * i + 2].copy_from_slice(&sample.to_le_bytes());
         }
-        self.file.write_all(&bytes)?;
-        self.samples += 160;
+        self.file.write_all(&bytes[..samples.len() * 2])?;
+        self.samples += samples.len() as u32;
         Ok(())
     }
     fn finish(&mut self) -> std::io::Result<()> {
@@ -416,6 +421,32 @@ mod tests {
         assert!(c.queue.is_empty());
         drop(c);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn five_ms_capture_excludes_padding_and_offsets_use_actual_samples() {
+        let dir = directory("five-ms");
+        let d = Diagnostics::bounded(16);
+        d.set_context("lab-tx", "lab-session");
+        let c = Capture::spawn(d, dir.clone());
+        c.start().unwrap();
+        let mut pcm = [999; 160];
+        pcm[..80].fill(123);
+        c.feed_frame(pcm, 80);
+        c.feed_frame(pcm, 80);
+        let end = c.stop().unwrap();
+        assert_eq!(end.samples, 160);
+        let bytes = std::fs::read(end.path.unwrap()).unwrap();
+        assert_eq!(bytes.len(), 44 + 160 * 2);
+        assert!(
+            bytes[44..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|b| i16::from_le_bytes(*b) == 123)
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(end.metadata_path.unwrap()).unwrap()).unwrap();
+        assert_eq!(metadata["frames"][1]["sample_offset"], 80);
     }
     #[test]
     fn overflow_timeout_sample_cap_stream_change_and_disk_error() {
