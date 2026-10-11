@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_app_desc.h"
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "protocol.h"
@@ -27,10 +28,13 @@ typedef struct
     struct sockaddr_in peer, audio;
     int64_t last;
     uint32_t epoch;
+    unsigned frame_ms, lab, fec, jitter_ms;
+    uint32_t lab_stream;
 } context_t;
 typedef struct
 {
-    uint32_t sequence, timestamp, epoch;
+    uint32_t sequence, timestamp, epoch, lab_stream;
+    unsigned sample_count, lab, fec;
     uint8_t session[16], key[32];
     struct sockaddr_in destination;
     int16_t samples[160];
@@ -109,6 +113,7 @@ static void reset_connection(void)
     ctx.paired = ctx.streaming = 0;
     ctx.epoch++;
     ctx.session[0] = 0;
+    ctx.frame_ms=10;ctx.lab=ctx.fec=ctx.lab_stream=0;ctx.jitter_ms=30;
     random_hex(ctx.nonce);
     xSemaphoreGive(mutex);
     portENTER_CRITICAL(&timing_lock);
@@ -153,9 +158,10 @@ static void discovery_task(void *arg)
             cJSON_AddStringToObject(m, "name", CONFIG_MIC_DEVICE_NAME);
             cJSON_AddStringToObject(m, "device_type", "esp32-wroom-32");
             cJSON *a = cJSON_AddArrayToObject(m, "capabilities");
-            const char *sources[] = {"sine", "sweep", "pulse", "silence"};
-            for (int i = 0; i < 4; i++)
+            const char *sources[] = {"sine", "sweep", "pulse", "silence", "audio_lab_v1"};
+            for (int i = 0; i < 5; i++)
                 cJSON_AddItemToArray(a, cJSON_CreateString(sources[i]));
+            char build[96];snprintf(build,sizeof build,"tx_build:%s",esp_app_get_description()->version);cJSON_AddItemToArray(a,cJSON_CreateString(build));
             cJSON_AddStringToObject(m, "nonce", c.nonce);
             cJSON_AddStringToObject(m, "commitment", commitment);
             cJSON_AddNumberToObject(m, "control_port", CONFIG_MIC_CONTROL_PORT);
@@ -284,7 +290,9 @@ static void control_task(void *arg)
         xSemaphoreTake(mutex, portMAX_DELAY);
         if (!strcmp(kind, "START_STREAM"))
         {
-            ctx.streaming = 1;
+            cJSON *t=cJSON_GetObjectItemCaseSensitive(m,"transport");
+            if(ctx.lab && (!t || mic_num(t,"frame_duration_ms")!=(int)ctx.frame_ms || mic_num(t,"jitter_buffer_target_ms")!=(int)ctx.jitter_ms || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(t,"fec"),"enabled"))!=(int)ctx.fec)) {error="transport START mismatch";}
+            else {ctx.streaming = 1;ctx.lab_stream=ctx.lab?(uint32_t)cJSON_GetObjectItemCaseSensitive(m,"transport_stream")->valuedouble:0;}
             ctx.epoch++;
             xQueueReset(frames);
         }
@@ -293,6 +301,12 @@ static void control_task(void *arg)
             ctx.streaming = 0;
             ctx.epoch++;
             xQueueReset(frames);
+        }
+        else if (!strcmp(kind, "SET_TRANSPORT")) {
+            cJSON *t=cJSON_GetObjectItemCaseSensitive(m,"transport");cJSON *f=cJSON_GetObjectItemCaseSensitive(t,"fec");
+            int ms=mic_num(t,"frame_duration_ms"),jitter=mic_num(t,"jitter_buffer_target_ms");
+            if(ctx.streaming || !t || (ms!=5&&ms!=10) || (jitter!=20&&jitter!=30&&jitter!=40&&jitter!=50&&jitter!=60&&jitter!=80&&jitter!=100) || strcmp(mic_str(f,"scheme"),"xor") || mic_num(f,"data_shards")!=4 || mic_num(f,"parity_shards")!=1 || !cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(f,"enabled"))) error="invalid stopped transport configuration";
+            else {ctx.lab=1;ctx.frame_ms=ms;ctx.jitter_ms=jitter;ctx.fec=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(f,"enabled"));ctx.lab_stream=0;ctx.epoch++;xQueueReset(frames);}
         }
         else if (!strcmp(kind, "SET_AUDIO_SOURCE"))
         {
@@ -331,6 +345,7 @@ static void control_task(void *arg)
         cJSON_AddStringToObject(reply, "session", c.session);
         if (error)
             cJSON_AddStringToObject(reply, "error", error);
+        if(!error && cJSON_GetObjectItemCaseSensitive(m,"transport")) {cJSON_AddItemToObject(reply,"transport",cJSON_Duplicate(cJSON_GetObjectItemCaseSensitive(m,"transport"),1));cJSON_AddNumberToObject(reply,"transport_stream",cJSON_GetObjectItemCaseSensitive(m,"transport_stream")->valuedouble);}
         mic_sign(reply, c.key, 32);
         int index = cached_count++ % 32;
         free(cached_reply[index]);
@@ -340,14 +355,16 @@ static void control_task(void *arg)
         cJSON_Delete(m);
     }
 }
+static TaskHandle_t generation_handle;
+static void generation_wakeup(void *arg) { xTaskNotifyGive(generation_handle); }
 static void generation_task(void *arg)
 {
-    TickType_t clock = xTaskGetTickCount();
+    int64_t next_us=0;
     audio_source_t source = {0};
     uint32_t sequence = 0, epoch = 0;
     while (1)
     {
-        vTaskDelayUntil(&clock, pdMS_TO_TICKS(10));
+        ulTaskNotifyTake(pdTRUE,portMAX_DELAY);
         context_t c = snapshot();
         if (!c.wifi || !c.paired || !c.streaming)
             continue;
@@ -357,18 +374,24 @@ static void generation_task(void *arg)
             sequence = 0;
             source.sample = 0;
             source.phase = 0;
+            next_us=esp_timer_get_time();
         }
+        int64_t now=esp_timer_get_time(),period=(int64_t)c.frame_ms*1000;
+        if(now<next_us)continue;
+        uint32_t skipped=(uint32_t)((now-next_us)/period);
+        next_us+=(skipped+1)*period;
         source.kind = c.source;
         frame_t frame = {
             .sequence = sequence++,
             .timestamp = (uint32_t)source.sample,
             .epoch = c.epoch,
+            .sample_count=c.frame_ms*16,.lab=c.lab,.fec=c.fec,.lab_stream=c.lab_stream,
             .destination = c.audio,
             .generated_us = esp_timer_get_time()
         };
         memcpy(frame.key, c.key, 32);
         memcpy(frame.session, c.session_bytes, 16);
-        audio_source_frame(&source, c.gain, c.mute, frame.samples);
+        audio_source_samples(&source, c.gain, c.mute, frame.samples,frame.sample_count);
         generated_frames++;
         frame.enqueued_us = esp_timer_get_time();
         if (xQueueSend(frames, &frame, 0) != pdTRUE)
@@ -384,7 +407,8 @@ static void generation_task(void *arg)
 static void transport_task(void *arg)
 {
     frame_t frame;
-    uint8_t packet[MIC_PACKET_SIZE], digest[32];
+    uint8_t packet[MIC_LAB_PACKET_MAX], digest[32];
+    int16_t parity[160]={0};uint32_t parity_base=0,parity_ts=0,parity_epoch=0;unsigned parity_mask=0;
     while (1)
     {
         if (xQueueReceive(frames, &frame, portMAX_DELAY) != pdTRUE)
@@ -396,12 +420,23 @@ static void transport_task(void *arg)
             continue;
         int64_t entry_time_us = esp_timer_get_time();
         int64_t queue_delay_us = dequeued_us - frame.enqueued_us;
-        mic_encode_body(packet, frame.sequence, frame.timestamp, frame.session, frame.samples);
-        mic_hmac(frame.key, 32, packet, 352, digest);
-        memcpy(packet + 352, digest, 16);
+        unsigned body=352;
+        if(frame.lab)body=mic_encode_lab(packet,frame.sequence,frame.timestamp,frame.session,frame.samples,frame.sample_count,frame.lab_stream,0);
+        else mic_encode_body(packet, frame.sequence, frame.timestamp, frame.session, frame.samples);
+        mic_hmac(frame.key, 32, packet, body, digest);memcpy(packet+body,digest,16);
+        xSemaphoreTake(mutex,portMAX_DELAY);
+        if(!ctx.streaming || ctx.epoch!=frame.epoch){xSemaphoreGive(mutex);continue;}
         int64_t send_started_us = esp_timer_get_time();
-        int res = sendto(audio_fd, packet, sizeof packet, 0, (struct sockaddr *)&frame.destination, sizeof frame.destination);
+        int res = sendto(audio_fd, packet, body+16, MSG_DONTWAIT, (struct sockaddr *)&frame.destination, sizeof frame.destination);
         int64_t completed_time_us = esp_timer_get_time();
+        if(frame.lab && frame.fec) {
+            uint32_t base=frame.sequence&~3u;
+            if(parity_epoch!=frame.epoch || parity_base!=base){memset(parity,0,sizeof parity);parity_mask=0;parity_base=base;parity_ts=frame.timestamp-(frame.sequence-base)*frame.sample_count;parity_epoch=frame.epoch;}
+            unsigned bit=1u<<(frame.sequence-base);
+            if(!(parity_mask&bit)){for(unsigned i=0;i<frame.sample_count;i++)parity[i]^=frame.samples[i];parity_mask|=bit;}
+            if(parity_mask==15){unsigned pb=mic_encode_lab(packet,base,parity_ts,frame.session,parity,frame.sample_count,frame.lab_stream,1);mic_hmac(frame.key,32,packet,pb,digest);memcpy(packet+pb,digest,16);if(sendto(audio_fd,packet,pb+16,MSG_DONTWAIT,(struct sockaddr *)&frame.destination,sizeof frame.destination)!=(int)(pb+16))drops++;parity_mask=0;}
+        }
+        xSemaphoreGive(mutex);
         int64_t send_duration_us = completed_time_us - send_started_us;
         portENTER_CRITICAL(&timing_lock);
         if (tx_timing.epoch != frame.epoch) {
@@ -421,7 +456,7 @@ static void transport_task(void *arg)
         if (generation_us > tx_timing.window_generation_max_us) tx_timing.window_generation_max_us = generation_us;
         if (preparation_us > tx_timing.window_preparation_max_us) tx_timing.window_preparation_max_us = preparation_us;
         if (queue_depth > tx_timing.window_queue_depth_max) tx_timing.window_queue_depth_max = queue_depth;
-        if (res == sizeof packet)
+        if (res == (int)(body+16))
         {
             packets++;
             tx_timing.window_successful++;
@@ -437,7 +472,7 @@ static void transport_task(void *arg)
                         tx_timing.window_max_interval_us = interval_us;
                     tx_timing.window_sum_interval_us += interval_us;
                     tx_timing.window_sum_sq_interval_us += (double)interval_us * interval_us;
-                    if (interval_us > 15000)
+                    if (interval_us > (int64_t)frame.sample_count*1000000/16000*3/2)
                         tx_timing.window_late_frames++;
 
                 }
@@ -561,7 +596,7 @@ void app_main(void)
     mutex = xSemaphoreCreateMutex();
     frames = xQueueCreate(4, sizeof(frame_t));
     configASSERT(mutex && frames);
-    ctx.gain = 1.0;
+    ctx.gain = 1.0;ctx.frame_ms=10;ctx.jitter_ms=30;
     random_hex(code);
     random_hex(ctx.nonce);
     ESP_ERROR_CHECK(esp_netif_init());
@@ -593,7 +628,11 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     configASSERT(xTaskCreate(discovery_task, "discovery", 4096, NULL, 3, NULL) == pdPASS);
     configASSERT(xTaskCreate(control_task, "control", 8192, NULL, 5, NULL) == pdPASS);
-    configASSERT(xTaskCreate(generation_task, "generation", 4096, NULL, 6, NULL) == pdPASS);
+    configASSERT(xTaskCreate(generation_task, "generation", 4096, NULL, 6, &generation_handle) == pdPASS);
+    esp_timer_handle_t generation_timer;
+    const esp_timer_create_args_t timer_args={.callback=generation_wakeup,.name="pcm-wakeup",.skip_unhandled_events=true};
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args,&generation_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(generation_timer,5000));
     configASSERT(xTaskCreate(transport_task, "transport", 4096, NULL, 5, NULL) == pdPASS);
     configASSERT(xTaskCreate(telemetry_task, "telemetry", 4096, NULL, 3, NULL) == pdPASS);
 }

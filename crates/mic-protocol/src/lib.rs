@@ -1,4 +1,5 @@
 pub mod diagnostics;
+pub mod lab;
 use anyhow::{Result, bail};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,10 @@ pub struct Message {
     pub mute: Option<bool>,
     #[serde(default)]
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<lab::TransportConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_stream: Option<u32>,
 }
 impl Message {
     pub fn new(kind: &str, id: &str, request_id: u32) -> Self {
@@ -69,6 +74,8 @@ impl Message {
             gain: None,
             mute: None,
             error: String::new(),
+            transport: None,
+            transport_stream: None,
         }
     }
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -90,6 +97,9 @@ impl Message {
         {
             bail!("invalid gain")
         }
+        if let Some(c) = m.transport {
+            c.validate()?;
+        }
         Ok(m)
     }
     // Signing bytes are independent of JSON field order, float formatting and whitespace.
@@ -104,7 +114,7 @@ impl Message {
                 Source::Silence => "silence",
             })
             .unwrap_or("");
-        format!(
+        let mut bytes = format!(
             "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.version,
             self.kind,
@@ -121,7 +131,20 @@ impl Message {
                 .unwrap_or_default(),
             self.mute.map(|m| if m { "1" } else { "0" }).unwrap_or("")
         )
-        .into_bytes()
+        .into_bytes();
+        if let Some(c) = self.transport {
+            bytes.extend(
+                format!(
+                    "|lab1|{}|{}|xor|4|1|{}|{}",
+                    c.frame_duration_ms,
+                    u8::from(c.fec.enabled),
+                    c.jitter_buffer_target_ms,
+                    self.transport_stream.unwrap_or(0)
+                )
+                .as_bytes(),
+            );
+        }
+        bytes
     }
     pub fn sign(&mut self, key: &[u8]) {
         self.proof = hex::encode(tag(key, &self.signing_bytes()));
@@ -221,6 +244,9 @@ impl Default for Generator {
 }
 impl Generator {
     pub fn frame(&mut self, gain: f32, mute: bool) -> [i16; SAMPLES] {
+        self.frame_n::<SAMPLES>(gain, mute)
+    }
+    pub fn frame_n<const N: usize>(&mut self, gain: f32, mute: bool) -> [i16; N] {
         std::array::from_fn(|_| {
             let t = self.sample as f64 / 16000.0;
             let freq = match self.source {
