@@ -3,16 +3,28 @@ import {FormsModule} from '@angular/forms';
 import {baseline,counters,finish,Experiment,LabConfig,quantile,rates} from './audio-lab-model';
 @Component({selector:'app-audio-lab',imports:[FormsModule],templateUrl:'./audio-lab.html',styleUrl:'./app.css'})
 export class AudioLab {
+ readonly sweepApi=input.required<(path:string,method?:string,body?:unknown)=>Promise<any>>();
  readonly devices=input<any[]>([]);readonly snapshot=input<any>({});readonly diagnostics=input<any>({});readonly online=input(false);readonly apply=input.required<(id:string,c:LabConfig)=>Promise<void>>();readonly version=input('unknown');
  id='';config=baseline();notes='';name='Baseline';readonly busy=signal(false);readonly error=signal('');readonly running=signal<Experiment|null>(null);readonly experiments=signal<Experiment[]>(this.restore());a=0;b=1;
+ frames=[5,10];fecs=[false,true];jitters=[20,30,50];duration=60;warmup=5;repetitions=1;mode='Automatic';order='Fixed';seed=42;planName='Parameter sweep';combinations:any[]=[];sortMetric='underruns_per_second';
+ sweep(){return this.snapshot().sweep||{};}
+ sweepActive(){return !['IDLE','COMPLETED','FAILED','CANCELLED',undefined].includes(this.sweep().status);}
+ toggle(list:any[],v:any,on:boolean){const i=list.indexOf(v);if(on&&i<0)list.push(v);else if(!on&&i>=0)list.splice(i,1);}
+ async preview(){try{this.combinations=await this.sweepApi()('/preview','POST',{frame:this.frames,fec:this.fecs,jitter:this.jitters});}catch(e){this.error.set(String(e));}}
+ plan(){return {plan_id:'plan-'+Date.now(),name:this.planName,created_at:Date.now(),device_id:this.id,matrix_parameters:{frame:this.frames,fec:this.fecs,jitter:this.jitters},selected_combinations:this.combinations,global_settings:{duration_seconds:this.duration,warmup_seconds:this.warmup,repetitions:this.repetitions,mode:this.mode,order:this.order},execution_order:[],random_seed:this.seed};}
+ estimate(){return this.combinations.filter(c=>c.enabled).reduce((n,c)=>n+((c.duration_seconds||this.duration)+this.warmup)*this.repetitions,0);}
+ async sweepAction(path:string,method='POST',body?:unknown){this.error.set('');try{await this.sweepApi()(path,method,body);}catch(e){this.error.set(String(e));}}
+ async loadPlan(){try{const p=await this.sweepApi()('/plan');this.id=p.device_id;this.planName=p.name;this.frames=p.matrix_parameters.frame;this.fecs=p.matrix_parameters.fec;this.jitters=p.matrix_parameters.jitter;this.combinations=p.selected_combinations;const s=p.global_settings;this.duration=s.duration_seconds;this.warmup=s.warmup_seconds;this.repetitions=s.repetitions;this.mode=s.mode;this.order=s.order;this.seed=p.random_seed;}catch(e){this.error.set(String(e));}}
+ async exportSweep(format:string){try{const d=await this.sweepApi()('');let text=JSON.stringify(d,null,2);if(format==='csv'){const keys=['underruns_per_second','late_drops_per_second','resyncs_per_second','authenticated_audio_pps','fec_recovered','missing_audio_samples_ratio'];const stats=['mean','median','min','max','standard_deviation'];text=['frame_ms,fec,jitter_ms,repetitions,valid_runs,'+keys.flatMap(k=>stats.map(s=>k+'_'+s)).join(','),...(d.comparison_summary||[]).map((r:any)=>[r.config.frame_duration_ms,r.config.fec.enabled,r.config.jitter_buffer_target_ms,r.repetitions,r.valid_runs,...keys.flatMap(k=>stats.map(s=>r.metrics[k]?.[s]??''))].join(','))].join('\n');}const url=URL.createObjectURL(new Blob([text],{type:format==='csv'?'text/csv':'application/json'}));const a=document.createElement('a');a.href=url;a.download='mymic-sweep-v2.'+format;a.click();URL.revokeObjectURL(url);}catch(e){this.error.set(String(e));}}
+ comparison(){return [...(this.sweep().comparison_summary||[])].sort((a,b)=>(a.metrics[this.sortMetric]?.mean??Infinity)-(b.metrics[this.sortMetric]?.mean??Infinity));}
  private restore():Experiment[]{try{return JSON.parse(localStorage.getItem('mymic-audio-lab-v1')||'[]').filter((e:any)=>e.version===1).slice(-20);}catch{return [];}}
  device(){return this.devices().find(d=>d.id===this.id);}
  state(){return this.snapshot().lab?.[this.id];}
  currentConfig():LabConfig {return this.state()?.applied||{...baseline(),jitter_buffer_target_ms:this.snapshot().active_device===this.id?(this.snapshot().metrics?.target_buffer_depth||3)*10:30};}
  selectDevice(id:string){this.id=id;this.config=structuredClone(this.currentConfig());}
  targetMs(){return this.state()?.applied?.jitter_buffer_target_ms??(this.snapshot().active_device===this.id?this.currentConfig().jitter_buffer_target_ms:null);}
- canStart(){const s=this.snapshot(),d=this.diagnostics();return this.online()&&s.active_device===this.id&&this.device()?.state==='STREAMING'&&s.diagnostic_stream_id===d.current_stream_id&&!['requested','failed'].includes(this.state()?.status);}
- supported(){return this.online()&&this.state()?.status!=='requested'&&this.device()?.capabilities.includes('audio_lab_v1')&&['CONNECTED','STREAMING'].includes(this.device()?.state);}
+ canStart(){if(this.sweepActive())return false;const s=this.snapshot(),d=this.diagnostics();return this.online()&&s.active_device===this.id&&this.device()?.state==='STREAMING'&&s.diagnostic_stream_id===d.current_stream_id&&!['requested','failed'].includes(this.state()?.status);}
+ supported(){return !this.sweepActive()&&this.online()&&this.state()?.status!=='requested'&&this.device()?.capabilities.includes('audio_lab_v1')&&['CONNECTED','STREAMING'].includes(this.device()?.state);}
  async configure(reset=false){this.busy.set(true);this.error.set('');try {await this.apply()(this.id,reset?baseline():this.config);if(reset)this.config=baseline();}catch(e){this.error.set(String(e));}finally{this.busy.set(false);}}
  private timer=setInterval(()=>this.sample(),500);
  ngOnDestroy(){clearInterval(this.timer);}

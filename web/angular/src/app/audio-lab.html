@@ -14,3 +14,22 @@
 <div class="controls"><label>比較 A<select [(ngModel)]="a">@for(e of experiments();track $index){<option [ngValue]="$index">{{e.name}} {{e.startedUtc}}</option>}</select></label><label>比較 B<select [(ngModel)]="b">@for(e of experiments();track $index){<option [ngValue]="$index">{{e.name}} {{e.startedUtc}}</option>}</select></label></div>
 <div class="controls">@for(i of [a,b];track $index){@if(experiments()[i];as e){<div><h3>{{e.name}}</h3><p>{{e.durationSeconds}} s · {{text(e.config)}} · validity {{text(e.invalid)}}</p><pre>{{text(e.delta)}}</pre><p>{{rates(e)}}</p><p>{{q(e)}}</p><p>Session {{e.session}} · TX {{e.txVersion}} · RX {{e.rxVersion}}</p></div>}}</div>
 </section>
+
+<section class="panel"><h2>Parameter Sweep v2</h2>
+<fieldset [disabled]="sweepActive()||!!running()"><label>計畫名稱<input [(ngModel)]="planName"></label>
+<p>Frame @for(v of [5,10];track v){<label><input type="checkbox" [checked]="frames.includes(v)" (change)="toggle(frames,v,$any($event.target).checked)">{{v}} ms</label>}</p>
+<p>FEC @for(v of [false,true];track v){<label><input type="checkbox" [checked]="fecs.includes(v)" (change)="toggle(fecs,v,$any($event.target).checked)">{{v?'On':'Off'}}</label>}</p>
+<p>Jitter @for(v of [20,30,50,80,100];track v){<label><input type="checkbox" [checked]="jitters.includes(v)" (change)="toggle(jitters,v,$any($event.target).checked)">{{v}} ms</label>}</p>
+<label>測量秒數<input type="number" min="10" max="180" [(ngModel)]="duration"></label><label>預熱秒數<input type="number" min="0" max="60" [(ngModel)]="warmup"></label>
+<label>重複<select [(ngModel)]="repetitions">@for(n of [1,2,3,5];track n){<option [ngValue]="n">{{n}}</option>}</select></label>
+<label>模式<select [(ngModel)]="mode"><option>Automatic</option><option>Step-by-step</option></select></label><label>順序<select [(ngModel)]="order"><option>Fixed</option><option>Randomized</option></select></label><label>Seed<input type="number" min="0" [(ngModel)]="seed"></label>
+<button (click)="preview()">產生／預覽矩陣</button><button (click)="sweepAction('/plan','PUT',plan())">保存計畫</button><button (click)="loadPlan()">載入計畫</button>
+@for(c of combinations;track c.combination_id){<div><label><input type="checkbox" [(ngModel)]="c.enabled" [disabled]="!!c.unsupported_reason">{{c.combination_id}}</label><input [(ngModel)]="c.name"><input type="number" min="10" max="180" placeholder="沿用全域秒數" [(ngModel)]="c.duration_seconds"><span>{{c.unsupported_reason}}</span></div>}
+<p>{{combinations.length}} 組候選 · 預估測量＋預熱 {{estimate()}} 秒（另加 ACK／切換時間）</p>
+<button (click)="sweepAction('','POST',plan())" [disabled]="!id||!online()||!combinations.length">Start Suite</button></fieldset>
+<button (click)="sweepAction('/cancel')" [disabled]="!sweepActive()">Cancel Suite</button><button (click)="sweepAction('/continue')" [disabled]="sweep().status!=='WAITING_FOR_USER'">Continue Next</button><button (click)="exportSweep('json')">Export JSON</button><button (click)="exportSweep('csv')">Export CSV</button>
+<p>Runner {{sweep().status||'IDLE'}} · 完成 {{sweep().runs?.length||0}} / {{sweep().total_runs||0}} · 本組剩餘 {{sweep().remaining_seconds||0}} 秒 · {{sweep().current_run?.combination_id}} · {{sweep().error||error()}}</p><p>生效設定 {{text(state()?.applied)}} · 實測端到端延遲 N/A</p>
+<label>比較排序<select [(ngModel)]="sortMetric">@for(k of ['underruns_per_second','late_drops_per_second','resyncs_per_second','authenticated_audio_pps','fec_recovered','missing_audio_samples_ratio'];track k){<option>{{k}}</option>}</select></label>
+<table><thead><tr><th>Frame / FEC / Jitter</th><th>Valid / Repetitions</th><th>Underruns/s</th><th>Late/s</th><th>Resync/s</th><th>PPS</th><th>FEC recovered</th><th>Missing ratio</th></tr></thead><tbody>@for(r of comparison();track r.combination_id){<tr><td>{{r.combination_id}}</td><td>{{r.valid_runs}} / {{r.repetitions}}</td>@for(k of ['underruns_per_second','late_drops_per_second','resyncs_per_second','authenticated_audio_pps','fec_recovered','missing_audio_samples_ratio'];track k){<td [title]="text(r.metrics[k])">{{r.metrics[k]?.mean??'N/A'}}</td>}</tr>}</tbody></table><p>表格顯示有效測試平均值；滑過指標可看 mean、median、min、max、population standard deviation。</p>
+@for(r of sweep().runs||[];track r.run_id){<details><summary>{{r.combination_id}} #{{r.repetition_index}} · {{r.validity}}</summary><pre>{{text(r)}}</pre></details>}
+</section>

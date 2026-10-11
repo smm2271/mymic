@@ -11,6 +11,7 @@ interface Output {id:string;name:string;is_default:boolean}
 @Component({selector:'app-root',imports:[FormsModule,TelemetryChart,ContinuityPanel,AudioLab],templateUrl:'./app.html',styleUrl:'./app.css'})
 export class App implements OnDestroy {
  readonly labSnapshot=signal<any>({});readonly buildVersion=signal('unknown');
+ readonly sweepApi=async(path:string,method='GET',body?:unknown)=>this.request('/lab/sweep'+path,method,body);
  readonly applyLab=async(id:string,c:LabConfig)=>{await this.request(`/devices/${id}/transport`,'PUT',c);};
  readonly diagnostics=signal<DiagnosticsSnapshot>(emptyDiagnostics());
  readonly online=signal(false);readonly error=signal('');readonly devices=signal<Device[]>([]);readonly outputs=signal<Output[]>([]);readonly metrics=signal<Record<string,any>>({});readonly busy=signal('');readonly socketState=signal('連線中');
