@@ -2,7 +2,7 @@
 
 ## 尚未驗收
 
-* 本機未找到 ESP-IDF／idf.py／IDF_PATH，**ESP-IDF完整建置未執行**；C host golden vectors不代表韌體已編譯或燒錄成功。
+* Audio Lab v1 本次已以 ESP-IDF 5.5.5 完成 ESP32 firmware build；尚未flash或做Wi-Fi實機驗收。C host vectors與成功build仍不能替代實機測試。
 * 未確認連接 ESP32-WROOM-32，沒有 Wi-Fi 實機 streaming 或斷線恢復測試。COM3 USB serial不是足夠硬體辨識依據。
 * Windows 已列出4個output並成功開啟／切換 CPAL WASAPI stream；沒有聲學聽測、loopback錄音或USB／藍牙專項測試，不宣稱已聽到聲音。
 * 沒有實測50 ms／30 ms端到端延遲。16 kHz、10 ms封包和30 ms初始jitter是配置，不是延遲量測；OS/device buffers会增加延遲。
@@ -24,7 +24,7 @@
 
 ## 優先順序
 
-1. 安裝ESP-IDF，以esp32 target完整build並處理SDK/compiler診斷；確認實機再燒錄。
+1. 依[Audio Lab Benchmark](audio-lab-benchmark.md)記錄firmware/RX版本，確認ESP32及COM埠再燒錄。
 2. 同LAN實機測配對、四種音源、Wi-Fi drop、輸出hotplug、UI關閉後播放。
 3. Windows loopback／聲學錄音確認440Hz與SRC，再量測generator首樣本→speaker聲学輸出的延遲。
 4. 四小時soak並檢查memory、queue depths、音訊中断與recoverability。

@@ -100,3 +100,10 @@ Chart.js 4.5.1＋annotation plugin 3.1.0，由Angular component lifecycle建立�
 # v0.5.2 additive timing contract
 
 See [audio-stability.md](audio-stability.md) for new optional TX/RX rates, authenticated Simulator diagnostics and metric definitions. Existing history and WebSocket contracts remain compatible. `lost_packets`/loss charts represent playout deadline deficits, not established UDP network loss. Receive bitrate now counts PCM payload bytes. Backend timestamps remain UTC; the UI defaults to browser local time and offers UTC.
+# Audio Lab v1 擴充
+
+原Telemetry/history與WS通知保留。WS status及`GET /api/v1/lab`新增每台裝置Requested/Applied/Failed設定、transport stream token、全域FEC counters及RX counter acquisition timestamp。Metrics新增Jitter physical capacity packets、actual buffered ms、contiguous playable ms。原target/depth仍是包數，不能直接當成毫秒。
+
+Continuity Diagnostics event_types/counts/counts_60s擴充至13項，前7項索引維持不變；新增FEC_RECOVERED、FEC_UNRECOVERABLE、FEC_TOO_LATE、FEC_PARITY_RECEIVED、TRANSPORT_CONFIG_APPLIED、TRANSPORT_CONFIG_REJECTED。Event新增playout_epoch，仍由背景worker補Session/clock/device context并保存，JSONL／manifest輪替機制不變。FEC的每組事件不合併；丟失記錄有notice_drops及既有event/observation drop counters。精確母體見 [FEC Design](fec-design.md)。
+
+Lab場次不使用全域累積值直接比較；開始／結束counter差值，stream/clock/session中斷或counter重設標invalid。UI interval distribution是500ms snapshot sampled population；每個packet/callback的分布使用原JSONL summary。未蒐集TX actual send interval及end-to-end latency顯示unavailable。

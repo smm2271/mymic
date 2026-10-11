@@ -1,5 +1,21 @@
 # Wire protocol v1／API v1
 
+Audio Lab v1 新增**協商後才使用**的音訊 wire v2；未協商裝置仍走下述原 v1。詳見 [設定協商](transport-configuration.md) 與 [FEC](fec-design.md)。
+
+## Lab wire v2（212／372 bytes）
+
+保留前32byte欄位與little-endian語意；offset4 version=2，offset5 type=1 PCM或2 parity，offset14 payload length=160或320。offset32新增u32 transport stream token，offset36開始80或160個i16 PCM，最後16byte為header＋payload HMAC-SHA256前16byte。總長必須精確等於36＋payload＋16，並匹配已確認的frame size；type2只在FEC啟用且group base對齊4時接受。type1 sequence每個真正生成音訊frame遞增，timestamp為首樣本index、每frame加80/160；type2 sequence/timestamp是該四包分組base，不占音訊sequence。START token使舊Session內的舊stream不可混入新timeline。
+
+新增控制欄位`transport`完整設定與`transport_stream:u32`，只在Lab控制／ACK出現。若有transport，原canonical bytes尾端附加：
+
+```
+|lab1|frame_duration_ms|fec_enabled_0_or_1|xor|4|1|jitter_buffer_target_ms|transport_stream
+```
+
+所有可影響播放／產生的Lab設定與token納入HMAC，不能只簽kind/request。固定scheme/shards由strictvalidation保證；旧消息沒有此suffix，原golden vector unchanged。SET_TRANSPORT只能stopped，ACK完整echo signed values；START帶同一confirmed config及新stream token。
+
+本機新增`PUT /api/v1/devices/{id}/transport`與`GET /api/v1/lab`；WS原snapshot擴充`lab`、`fec`、`counter_monotonic_us`，保留原schema欄位。Lab恢復Baseline是10ms／FECoff／30ms的**已協商v2**設定；真正舊版v1依然可從未協商或重新配對的裝置使用，UI不假裝兩者wire overhead相同。
+
 所有整數使用 Little Endian；控制 JSON UTF-8 最多 2048 bytes；音訊不使用 JSON。所有網路埠可設定。
 
 | 用途 | 預設 |

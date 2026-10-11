@@ -33,7 +33,7 @@ idf.py -p COMx flash monitor
 
 替換 COMx 為已確認的 ESP32 serial port；不可僅看到 USB serial 就假設是 ESP32。這次環境可見 COM3 USB serial，但 VID/PID 未能證實為 ESP32，未燒錄。
 
-Wi-Fi 凭證只寫入 local `sdkconfig`（已忽略），不要寫入 `sdkconfig.defaults`、原始碼或 Git。`menuconfig` 中為本機 Wi-Fi 設定，不需連接 INMP441 或任何實體麥克風。Wi-Fi STA 關閉 power saving，生成 tick 使用1000 Hz FreeRTOS tick。
+Wi-Fi 凭證只寫入 local `sdkconfig`（已忽略），不要寫入 `sdkconfig.defaults`、原始碼或 Git。`menuconfig` 中為本機 Wi-Fi 設定，不需連接 INMP441 或任何實體麥克風。Wi-Fi STA 關閉 power saving，新版合成音源使用5 ms ESP Timer通知與monotonic deadline；不代表I²S時鐘或實際送包間隔已驗證。
 
 Rust 和 ESP32 必須在同一可互通 IPv4 LAN。避開 guest isolation、AP client isolation、阻擋 broadcast 的網段／VPN。Windows 防火牆若阻擋入站，允許本服務 exe 在**私人**網路的 UDP discovery/control/audio，預設41000–41002；不要把 HTTP API 改成公網監聽。本次沒有改動 Windows 防火牆或隱私設定。
 
@@ -56,3 +56,8 @@ Boot log 顯示 device ID 和 32 位 code；在 localhost UI 核准，按「啟�
 ## C host test
 
 需 GCC 和 Windows SDK-compatible headers/libraries（本機 MSYS2 UCRT64）。`tests/host/run.ps1` 使用 vendored cJSON 1.7.19（附 MIT license），以 Windows BCrypt adapter 代用 mbedTLS SHA/HMAC。這只測 byte encoding、canonical 控制簽章及音源，不會模擬 FreeRTOS／Wi-Fi。
+
+
+## Audio Lab v1
+
+新版TX能力協商後，可在原UI切換5/10 ms、4+1 XOR FEC及20–100 ms Target。先讀[Audio Lab操作與限制](audio-lab.md)及[實測矩陣](audio-lab-benchmark.md)。舊TX保持原v1 Baseline；設定失敗不得以未確認格式繼續播放。
