@@ -54,10 +54,25 @@ fn core_error(error: String) -> ApiError {
     ApiError(status, error)
 }
 async fn guard(State(app): State<App>, req: Request, next: Next) -> Response {
-    let path=req.uri().path().to_string();
-    let protected=req.method()!=axum::http::Method::GET && !path.starts_with("/api/v1/lab/sweep") && !matches!(*req.method(),axum::http::Method::OPTIONS|axum::http::Method::HEAD);
-    let _lease=if protected {Some(app.sweep.gate.lock().await)}else{None};
-    if protected && app.sweep.active().await {return ApiError(StatusCode::CONFLICT,"parameter sweep already active".into()).into_response();}
+    let path = req.uri().path().to_string();
+    let protected = req.method() != axum::http::Method::GET
+        && !path.starts_with("/api/v1/lab/sweep")
+        && !matches!(
+            *req.method(),
+            axum::http::Method::OPTIONS | axum::http::Method::HEAD
+        );
+    let _lease = if protected {
+        Some(app.sweep.gate.lock().await)
+    } else {
+        None
+    };
+    if protected && app.sweep.active().await {
+        return ApiError(
+            StatusCode::CONFLICT,
+            "parameter sweep already active".into(),
+        )
+        .into_response();
+    }
     let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
     if let Some(o) = origin
         && !app.origins.iter().any(|s| s == o)
@@ -322,14 +337,60 @@ async fn events(State(a): State<App>, ws: WebSocketUpgrade) -> Response {
  })
 }
 
-async fn sweep_status(State(a):State<App>)->Json<Value>{Json(a.sweep.data.lock().await.clone())}
-async fn sweep_preview(Json(m):Json<sweep_model::Matrix>)->Json<Value>{Json(json!(m.build()))}
-async fn sweep_start(State(a):State<App>,Json(p):Json<sweep_model::Plan>)->ApiResult{a.sweep.start(a.core,p).await.map_err(core_error)?;Ok(Json(json!({"ok":true})))}
-async fn sweep_save(State(a):State<App>,Json(mut p):Json<sweep_model::Plan>)->ApiResult{p.validate().map_err(bad)?;a.sweep.save_plan(&p).await.map_err(bad)?;Ok(Json(json!(p)))}
-async fn sweep_load(State(a):State<App>)->ApiResult{Ok(Json(a.sweep.load_plan().map_err(bad)?))}
-async fn sweep_cancel(State(a):State<App>)->ApiResult{if !a.sweep.active().await{return Err(bad("no active suite"))}a.sweep.data.lock().await["cancel_requested"]=true.into();Ok(Json(json!({"ok":true})))}
-async fn sweep_continue(State(a):State<App>)->ApiResult{let mut d=a.sweep.data.lock().await;if d["status"]!="WAITING_FOR_USER"{return Err(bad("runner is not waiting"))}d["continue_requested"]=true.into();Ok(Json(json!({"ok":true})))}
-async fn sweep_export(State(a):State<App>,Query(q):Query<std::collections::HashMap<String,String>>)->Response{let d=a.sweep.data.lock().await;if q.get("format").is_some_and(|f|f=="csv"){([(axum::http::header::CONTENT_TYPE,"text/csv; charset=utf-8")],sweep_model::csv(&d["comparison_summary"])).into_response()}else{Json(d.clone()).into_response()}}
+async fn sweep_history(State(a): State<App>) -> ApiResult {
+    Ok(Json(json!(a.sweep.history().map_err(bad)?)))
+}
+async fn sweep_read(State(a): State<App>, Path(id): Path<String>) -> ApiResult {
+    Ok(Json(a.sweep.read_archive(&id).map_err(bad)?))
+}
+async fn sweep_status(State(a): State<App>) -> Json<Value> {
+    Json(a.sweep.data.lock().await.clone())
+}
+async fn sweep_preview(Json(m): Json<sweep_model::Matrix>) -> Json<Value> {
+    Json(json!(m.build()))
+}
+async fn sweep_start(State(a): State<App>, Json(p): Json<sweep_model::Plan>) -> ApiResult {
+    a.sweep.start(a.core, p).await.map_err(core_error)?;
+    Ok(Json(json!({"ok":true})))
+}
+async fn sweep_save(State(a): State<App>, Json(mut p): Json<sweep_model::Plan>) -> ApiResult {
+    p.validate().map_err(bad)?;
+    a.sweep.save_plan(&p).await.map_err(bad)?;
+    Ok(Json(json!(p)))
+}
+async fn sweep_load(State(a): State<App>) -> ApiResult {
+    Ok(Json(a.sweep.load_plan().map_err(bad)?))
+}
+async fn sweep_cancel(State(a): State<App>) -> ApiResult {
+    if !a.sweep.active().await {
+        return Err(bad("no active suite"));
+    }
+    a.sweep.data.lock().await["cancel_requested"] = true.into();
+    Ok(Json(json!({"ok":true})))
+}
+async fn sweep_continue(State(a): State<App>) -> ApiResult {
+    let mut d = a.sweep.data.lock().await;
+    if d["status"] != "WAITING_FOR_USER" {
+        return Err(bad("runner is not waiting"));
+    }
+    d["continue_requested"] = true.into();
+    Ok(Json(json!({"ok":true})))
+}
+async fn sweep_export(
+    State(a): State<App>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let d = a.sweep.data.lock().await;
+    if q.get("format").is_some_and(|f| f == "csv") {
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],
+            sweep_model::csv(&d["comparison_summary"]),
+        )
+            .into_response()
+    } else {
+        Json(d.clone()).into_response()
+    }
+}
 
 fn port(name: &str, default: u16) -> anyhow::Result<u16> {
     Ok(std::env::var(name)
@@ -382,6 +443,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let routes = Router::new()
         .route("/api/v1/lab/sweep", get(sweep_status).post(sweep_start))
+        .route("/api/v1/lab/sweep/history", get(sweep_history))
+        .route("/api/v1/lab/sweep/history/{id}", get(sweep_read))
         .route("/api/v1/lab/sweep/preview", post(sweep_preview))
         .route("/api/v1/lab/sweep/plan", get(sweep_load).put(sweep_save))
         .route("/api/v1/lab/sweep/cancel", post(sweep_cancel))
