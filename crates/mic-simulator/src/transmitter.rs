@@ -14,6 +14,8 @@ use std::{
 };
 #[derive(Clone)]
 pub struct Settings {
+    pub transport: Option<mic_protocol::lab::TransportConfig>,
+    pub stream: u32,
     pub running: bool,
     pub epoch: u64,
     pub session: [u8; 16],
@@ -27,6 +29,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            transport: None,
+            stream: 0,
             running: false,
             epoch: 0,
             session: [0; 16],
@@ -187,6 +191,7 @@ fn run(
         Ok(())
     });
     let mut clock: Option<DeadlineClock> = None;
+    let mut parity = mic_protocol::lab::ParityEncoder::default();
     let mut epoch = 0;
     let mut generator = Generator::default();
     let mut counts = Counts::default();
@@ -260,7 +265,17 @@ fn run(
         }
         if clock.is_none() || epoch != state.epoch {
             epoch = state.epoch;
-            clock = Some(DeadlineClock::new(Instant::now()));
+            let cfg = state.transport.unwrap_or_default();
+            let mut new_clock = DeadlineClock::new(Instant::now());
+            new_clock.frame_ms = cfg.frame_duration_ms as u64;
+            clock = Some(new_clock);
+            ticker = runtime.block_on(async {
+                let mut t =
+                    tokio::time::interval(Duration::from_millis(cfg.frame_duration_ms as u64));
+                t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                t
+            });
+            parity = mic_protocol::lab::ParityEncoder::default();
             generator = Generator::default();
             counts = Counts::default();
             previous_sent = 0;
@@ -290,14 +305,17 @@ fn run(
             (
                 slot,
                 0,
-                now.saturating_duration_since(c.start + Duration::from_millis(slot * 10)),
+                now.saturating_duration_since(c.start + Duration::from_millis(slot * c.frame_ms)),
             )
         } else {
             c.due(now)
         };
-        counts.missed_deadlines += u64::from(delay >= PERIOD);
-        counts.sequence_gaps_generated_by_tx += skipped;
-        scheduling_drift = now.duration_since(c.start).as_secs_f64() * 1000.0 - slot as f64 * 10.0;
+        counts.missed_deadlines += u64::from(delay >= Duration::from_millis(c.frame_ms));
+        if state.transport.is_none() {
+            counts.sequence_gaps_generated_by_tx += skipped;
+        }
+        scheduling_drift =
+            now.duration_since(c.start).as_secs_f64() * 1000.0 - slot as f64 * c.frame_ms as f64;
         if delays.len() < 256 {
             delays.push(delay.as_secs_f64() * 1000.0);
         }
@@ -307,13 +325,18 @@ fn run(
             continue;
         }
         if options.mode != Mode::Current
-            && previous_send.is_some_and(|p| now.duration_since(p) < Duration::from_millis(5))
+            && previous_send
+                .is_some_and(|p| now.duration_since(p) < Duration::from_micros(c.frame_ms * 500))
         {
-            counts.sequence_gaps_generated_by_tx += 1;
+            if gate.transport.is_none() {
+                counts.sequence_gaps_generated_by_tx += 1;
+            }
             continue;
         }
-        if generator.sample != slot * 160 {
-            generator.sample = slot * 160;
+        let cfg = gate.transport.unwrap_or_default();
+        let samples = cfg.samples();
+        if gate.transport.is_none() && generator.sample != slot * samples as u64 {
+            generator.sample = slot * samples as u64;
             let t = generator.sample as f64 / 16000.0;
             generator.phase = match gate.source {
                 Source::Sweep => {
@@ -325,15 +348,36 @@ fn run(
         }
         generator.source = gate.source.clone();
         let p = AudioPacket {
-            sequence: slot as u32,
-            timestamp: slot.wrapping_mul(160) as u32,
+            sequence: if gate.transport.is_some() {
+                counts.generated_packets as u32
+            } else {
+                slot as u32
+            },
+            timestamp: generator.sample as u32,
             session: gate.session,
-            samples: generator.frame(gate.gain, gate.mute),
+            samples: if samples == 160 {
+                generator.frame(gate.gain, gate.mute)
+            } else {
+                let mut pcm = [0; 160];
+                pcm[..80].copy_from_slice(&generator.frame_n::<80>(gate.gain, gate.mute));
+                pcm
+            },
         };
         counts.generated_packets += 1;
-        counts.generated_samples += 160;
+        counts.generated_samples += samples as u64;
+        let lp = mic_protocol::lab::LabPacket {
+            audio: p.clone(),
+            parity: false,
+            stream: gate.stream,
+            samples,
+        };
+        let parity_packet = if cfg.fec.enabled {
+            parity.push(&lp)
+        } else {
+            None
+        };
         if let Some(peer) = gate.peer {
-            if options.loss > 0 && (slot + 1).is_multiple_of(options.loss as u64) {
+            if options.loss > 0 && (p.sequence as u64 + 1).is_multiple_of(options.loss as u64) {
                 counts.intentional_loss_drops += 1;
             } else {
                 let due = now
@@ -342,8 +386,14 @@ fn run(
                     } else {
                         rand::random::<u64>() % (options.jitter_ms + 1)
                     });
-                let bytes = p.encode(&gate.key);
-                if options.reorder > 0 && (slot + 1).is_multiple_of(options.reorder as u64) {
+                let bytes = if gate.transport.is_some() {
+                    lp.encode(&gate.key)
+                } else {
+                    p.encode(&gate.key)
+                };
+                if options.reorder > 0
+                    && (p.sequence as u64 + 1).is_multiple_of(options.reorder as u64)
+                {
                     held = Some((due, bytes, peer));
                 } else {
                     if queue.len() < 16 {
@@ -359,6 +409,13 @@ fn run(
                         }
                     }
                 }
+            }
+        }
+        if let (Some(p), Some(peer)) = (parity_packet, gate.peer) {
+            if queue.len() < 16 {
+                queue.push_back((now, p.encode(&gate.key), peer));
+            } else {
+                counts.queue_drops += 1;
             }
         }
         while queue.front().is_some_and(|p| p.0 <= Instant::now()) {

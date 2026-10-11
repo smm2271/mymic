@@ -232,6 +232,24 @@ async fn diagnostics(State(a): State<App>) -> Json<Value> {
         json!({"continuity":a.core.playback.diagnostics.snapshot(),"capture":a.core.playback.capture.status()}),
     )
 }
+async fn transport(
+    State(a): State<App>,
+    Path(id): Path<String>,
+    body: Result<Json<mic_protocol::lab::TransportConfig>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult {
+    let Json(config) = body.map_err(bad)?;
+    config.validate().map_err(bad)?;
+    a.core
+        .command(id.clone(), Action::Transport(config))
+        .await
+        .map_err(core_error)?;
+    Ok(Json(
+        json!({"ok":true,"device_id":id,"confirmed":config,"status":"applied"}),
+    ))
+}
+async fn lab_snapshot(State(a): State<App>) -> Json<Value> {
+    Json(json!(a.core.snapshot.read().await.clone()))
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DiagnosticsOptions {
@@ -350,6 +368,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/devices/{id}/pair", post(pair))
         .route("/api/v1/devices/{id}/disconnect", post(disconnect))
         .route("/api/v1/devices/{id}/audio", patch(audio))
+        .route("/api/v1/devices/{id}/transport", put(transport))
+        .route("/api/v1/lab", get(lab_snapshot))
         .route("/api/v1/audio/outputs", get(outputs))
         .route("/api/v1/audio/output", put(output))
         .route("/api/v1/metrics", get(metrics))

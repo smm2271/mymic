@@ -1,7 +1,17 @@
 use anyhow::{Result, anyhow};
+use mic_audio::fec::{FecDecoder, FecMetrics};
 use mic_audio::{Engine, Metrics, Playback};
 use mic_device::{Device, State};
+use mic_protocol::lab::{CAPABILITY, LabPacket, TransportConfig};
 use mic_protocol::{AudioPacket, Message, Source, commitment, session_key};
+#[derive(Clone, Default, Serialize)]
+pub struct LabState {
+    pub requested: Option<TransportConfig>,
+    pub applied: Option<TransportConfig>,
+    pub status: String,
+    pub error: Option<String>,
+    pub stream: u32,
+}
 use mic_telemetry::{Counters, DeviceInput, EventType, Telemetry};
 use serde::Serialize;
 use std::{
@@ -15,11 +25,17 @@ use tokio::{
     sync::{RwLock, mpsc, oneshot},
     time,
 };
+#[cfg(test)]
+mod lab_control_tests;
 #[derive(Clone, Serialize)]
 pub struct Snapshot {
     pub devices: Vec<Device>,
     pub metrics: Metrics,
     pub active_device: Option<String>,
+    pub lab: HashMap<String, LabState>,
+    pub fec: FecMetrics,
+    pub counter_monotonic_us: u64,
+    pub diagnostic_stream_id: u64,
 }
 #[derive(Clone)]
 pub struct Core {
@@ -36,6 +52,7 @@ pub struct Command {
 #[derive(Debug)]
 pub enum Action {
     Pair(String),
+    Transport(TransportConfig),
     Reject,
     Disconnect,
     Audio {
@@ -46,6 +63,7 @@ pub enum Action {
     },
 }
 struct Entry {
+    lab: LabState,
     device: Device,
     peer: SocketAddr,
     nonce: String,
@@ -90,6 +108,20 @@ impl Default for Config {
 fn random_hex() -> String {
     hex::encode(rand::random::<[u8; 16]>())
 }
+fn emit_fec(engine: &Engine, fec: &mut FecDecoder) {
+    while let Some((kind, sequence, reason)) = fec.take_notice() {
+        engine.playback.diagnostics.emit_deadline(
+            kind,
+            Some(sequence),
+            engine.jitter.expected_sequence(),
+            engine.jitter.occupancy(),
+            engine.jitter.depth,
+            None,
+            reason,
+            fec.deadline_sequence(),
+        );
+    }
+}
 async fn send(socket: &UdpSocket, m: &Message, peer: SocketAddr) {
     if let Ok(b) = serde_json::to_vec(m) {
         let _ = socket.send_to(&b, peer).await;
@@ -102,6 +134,10 @@ fn fail(e: &mut Entry, error: &str) {
         let _ = reply.send(Err(error.into()));
     }
     e.device.last_error = Some(error.into());
+    if e.lab.status == "requested" {
+        e.lab.status = "failed".into();
+        e.lab.error = Some(error.into());
+    }
 }
 fn pair_message(
     e: &mut Entry,
@@ -141,6 +177,10 @@ impl Core {
             devices: vec![],
             metrics: engine.metrics(),
             active_device: None,
+            lab: HashMap::new(),
+            fec: FecMetrics::default(),
+            counter_monotonic_us: 0,
+            diagnostic_stream_id: 0,
         }));
         let (tx, rx) = mpsc::channel(32);
         let (stop, stopped) = oneshot::channel();
@@ -201,118 +241,142 @@ async fn run(
     let mut heartbeat = Instant::now();
     let mut audio_baseline = audio_counters(&engine);
     let counter_clock = Instant::now();
+    let mut fec = FecDecoder::default();
     loop {
         tokio::select! {
-                                                    _=&mut stopped=>break,
-                                                    Ok((n,peer))=discovery.recv_from(&mut db)=>{
-                                                     let Ok(m)=Message::decode(&db[..n]) else{continue};if m.kind!="DISCOVER" || m.nonce.len()!=32 || m.commitment.len()!=64 || m.control_port==0 || hex::decode(&m.nonce).is_err() || hex::decode(&m.commitment).is_err(){continue}
-                                                     if !entries.contains_key(&m.device_id) && entries.len()>=64 {continue}
-                                                     let target=SocketAddr::new(peer.ip(),m.control_port);
-                                                     let e=entries.entry(m.device_id.clone()).or_insert_with(||Entry{device:Device{id:m.device_id.clone(),name:m.name.clone(),device_type:m.device_type.clone(),capabilities:m.capabilities.clone(),address:target.to_string(),state:State::Discovered,source:Source::Sine,gain:1.0,mute:false,last_error:None},peer:target,nonce:m.nonce.clone(),commitment:m.commitment.clone(),code:None,key:[0;32],session:String::new(),last:Instant::now(),pending:None,desired:false,last_request:0,rejected_nonce:None,counters:Counters::default(),activity_epoch:0,accepted_session:None,tx:None});
-                                                     if e.rejected_nonce.as_ref()==Some(&m.nonce) {continue}
-                               if matches!(e.device.state,State::Connected|State::Streaming|State::Pairing){continue}
-                                                     // Reconnecting a known identity requires the previous credential to verify the fresh commitment.
-                                                     if let Some(code)=&e.code&& commitment(code,&m.nonce)!=m.commitment {continue}
-                                                     e.rejected_nonce=None;e.peer=target;e.device.address=target.to_string();e.nonce=m.nonce.clone();e.commitment=m.commitment.clone();e.last=Instant::now();e.device.state=State::Discovered;
-                                                     let mut offer=Message::new("OFFER",&m.device_id,m.request_id);offer.nonce=m.nonce;offer.audio_port=config.audio;offer.control_port=config.control;send(&socket,&offer,target).await;
-                                                     if let Some(code)=e.code.clone(){request=request.wrapping_add(1);let pair=pair_message(e,code,request,config.audio,config.control);send(&socket,&pair,e.peer).await;e.pending=Some(Pending{messages:vec![pair],position:0,reply:None,sent:Instant::now(),retries:0});}
-                                                    },
-                                                    Ok((n,peer))=socket.recv_from(&mut cb)=>{
-                        if let Ok(d)=serde_json::from_slice::<mic_protocol::diagnostics::Diagnostic>(&cb[..n]) {
-                            if let Some(e)=entries.get_mut(&d.device_id) && peer.ip()==e.peer.ip() && d.session_id==e.session && d.verify(&e.key) && e.tx.as_ref().is_none_or(|(_,_,sequence)|d.sequence>*sequence) {e.tx=Some((d.timing,Instant::now(),d.sequence));}continue;
-                        }
+                                                                    _=&mut stopped=>break,
+                                                                    Ok((n,peer))=discovery.recv_from(&mut db)=>{
+                                                                     let Ok(m)=Message::decode(&db[..n]) else{continue};if m.kind!="DISCOVER" || m.nonce.len()!=32 || m.commitment.len()!=64 || m.control_port==0 || hex::decode(&m.nonce).is_err() || hex::decode(&m.commitment).is_err(){continue}
+                                                                     if !entries.contains_key(&m.device_id) && entries.len()>=64 {continue}
+                                                                     let target=SocketAddr::new(peer.ip(),m.control_port);
+                                                                     let e=entries.entry(m.device_id.clone()).or_insert_with(||Entry{lab:LabState::default(),device:Device{id:m.device_id.clone(),name:m.name.clone(),device_type:m.device_type.clone(),capabilities:m.capabilities.clone(),address:target.to_string(),state:State::Discovered,source:Source::Sine,gain:1.0,mute:false,last_error:None},peer:target,nonce:m.nonce.clone(),commitment:m.commitment.clone(),code:None,key:[0;32],session:String::new(),last:Instant::now(),pending:None,desired:false,last_request:0,rejected_nonce:None,counters:Counters::default(),activity_epoch:0,accepted_session:None,tx:None});
+                                                                     if e.rejected_nonce.as_ref()==Some(&m.nonce) {continue}
+                                               if matches!(e.device.state,State::Connected|State::Streaming|State::Pairing){continue}
+                                                                     // Reconnecting a known identity requires the previous credential to verify the fresh commitment.
+                                                                     if let Some(code)=&e.code&& commitment(code,&m.nonce)!=m.commitment {continue}
+                                                                     e.rejected_nonce=None;e.device.capabilities=m.capabilities.clone();e.peer=target;e.device.address=target.to_string();e.nonce=m.nonce.clone();e.commitment=m.commitment.clone();e.last=Instant::now();e.device.state=State::Discovered;
+                                                                     let mut offer=Message::new("OFFER",&m.device_id,m.request_id);offer.nonce=m.nonce;offer.audio_port=config.audio;offer.control_port=config.control;send(&socket,&offer,target).await;
+                                                                     if let Some(code)=e.code.clone(){request=request.wrapping_add(1);let pair=pair_message(e,code,request,config.audio,config.control);send(&socket,&pair,e.peer).await;e.pending=Some(Pending{messages:vec![pair],position:0,reply:None,sent:Instant::now(),retries:0});}
+                                                                    },
+                                                                    Ok((n,peer))=socket.recv_from(&mut cb)=>{
+                                        if let Ok(d)=serde_json::from_slice::<mic_protocol::diagnostics::Diagnostic>(&cb[..n]) {
+                                            if let Some(e)=entries.get_mut(&d.device_id) && peer.ip()==e.peer.ip() && d.session_id==e.session && d.verify(&e.key) && e.tx.as_ref().is_none_or(|(_,_,sequence)|d.sequence>*sequence) {e.tx=Some((d.timing,Instant::now(),d.sequence));}continue;
+                                        }
 
-                                                     let Ok(m)=Message::decode(&cb[..n]) else{continue};let Some(e)=entries.get_mut(&m.device_id)else{continue};
-                                                     if peer!=e.peer || m.session!=e.session || !m.verify(&e.key){continue};e.last=Instant::now();
-                                                     if m.kind=="HEARTBEAT" {continue}
-                                                     let Some(mut pending)=e.pending.take() else{continue};let current=&pending.messages[pending.position];if m.request_id!=current.request_id{e.pending=Some(pending);continue}
-                                                     if m.kind=="PAIR_REJECT" || m.kind=="ERROR" {e.pending=Some(pending);fail(e,&m.error);e.device.state=State::Discovered;e.code=None;continue}
-                                                     if (current.kind=="PAIR_REQUEST" && m.kind!="PAIR_ACCEPT") || (current.kind!="PAIR_REQUEST" && m.kind!="ACK"){e.pending=Some(pending);continue}
-                                                     match current.kind.as_str(){"PAIR_REQUEST"=>{
-                        if e.accepted_session.as_ref()!=Some(&e.session) {e.activity_epoch+=1;telemetry.event(&e.device.id,Some(e.session.clone()),EventType::SessionChanged);}
-                        if e.accepted_session.is_some(){telemetry.event(&e.device.id,Some(e.session.clone()),EventType::Reconnect);}
-                        e.tx=None;e.accepted_session=Some(e.session.clone());e.device.state=State::Connected;e.device.last_error=None;
-                                             for kind in ["SET_AUDIO_SOURCE","SET_GAIN","SET_MUTE"] {request=request.wrapping_add(1);let mut restore=control(e,kind,request);match kind {"SET_AUDIO_SOURCE"=>restore.source=Some(e.device.source.clone()),"SET_GAIN"=>restore.gain=Some(e.device.gain),_=>restore.mute=Some(e.device.mute)}restore.sign(&e.key);pending.messages.push(restore);}
-                                             if e.desired && active.as_ref().is_none_or(|id|id==&e.device.id) {active=Some(e.device.id.clone());request=request.wrapping_add(1);pending.messages.push(control(e,"START_STREAM",request));}},"START_STREAM"=>{e.activity_epoch+=1;telemetry.event(&e.device.id,Some(e.session.clone()),EventType::StartStream);audio_baseline=audio_counters(&engine);e.device.state=State::Streaming;e.desired=true;active=Some(e.device.id.clone());engine.reset();engine.set_context(&e.device.id,&e.session);tick.reset();engine.set_mute(e.device.mute);},"STOP_STREAM"=>{account_audio(&engine,e,&mut audio_baseline);e.activity_epoch+=1;telemetry.event(&e.device.id,Some(e.session.clone()),EventType::StopStream);e.device.state=State::Connected;e.desired=false;if active.as_ref()==Some(&e.device.id){active=None;engine.reset();}},"SET_AUDIO_SOURCE"=>e.device.source=current.source.clone().unwrap(),"SET_GAIN"=>e.device.gain=current.gain.unwrap(),"SET_MUTE"=>{e.device.mute=current.mute.unwrap();if active.as_ref()==Some(&e.device.id){engine.set_mute(e.device.mute);}},_=>{}}
-                                                     e.last_request=m.request_id;pending.position+=1;
-                                                     if pending.position==pending.messages.len(){if let Some(reply)=pending.reply.take(){let _=reply.send(Ok(()));}}
-                                                     else {pending.sent=Instant::now();pending.retries=0;send(&socket,&pending.messages[pending.position],e.peer).await;e.pending=Some(pending);}
-                                                    },
-                                                    Ok((n,peer))=audio.recv_from(&mut ab)=>{
-         let arrival_us=engine.playback.diagnostics.now_us();
-         engine.jitter.metrics.received_datagrams+=1;
-         if let Some(id)=&active && let Some(e)=entries.get_mut(id) {
-          if peer.ip()!=e.peer.ip(){engine.jitter.metrics.rejected_packets+=1;engine.jitter.metrics.session_rejections+=1;continue}
-          match AudioPacket::decode(&ab[..n],&e.key) {
-           Ok(p) if hex::encode(p.session)==e.session && e.device.state==State::Streaming=>{e.last=Instant::now();engine.receive_at(p,arrival_us);account_audio(&engine,e,&mut audio_baseline)},
-           Ok(_)=>{engine.jitter.metrics.rejected_packets+=1;engine.jitter.metrics.session_rejections+=1;},
-           Err(error)=>{engine.jitter.metrics.rejected_packets+=1;engine.jitter.metrics.invalid_packets+=1;if error.to_string().contains("authentication"){engine.jitter.metrics.authentication_failures+=1;}else{engine.jitter.metrics.invalid_packet_headers+=1;}}
-          }
-         }else {engine.jitter.metrics.unpaired_datagrams+=1;}
-        },
-        Some(command)=commands.recv()=>{
-                                                     let Some(e)=entries.get_mut(&command.id)else{let _=command.reply.send(Err("device not found".into()));continue};if e.pending.is_some(){let _=command.reply.send(Err("device command in progress".into()));continue}
-                                                     request=request.wrapping_add(1);let mut messages=vec![];
-                                                     match command.action {
-                                                      Action::Pair(code)=>{if e.device.state!=State::Discovered || code.len()!=32 || hex::decode(&code).is_err() || commitment(&code,&e.nonce)!=e.commitment{let _=command.reply.send(Err("invalid pairing credential or state".into()));continue}messages.push(pair_message(e,code,request,config.audio,config.control));},
-                                                      Action::Reject=>{e.rejected_nonce=Some(e.nonce.clone());let m=Message::new("PAIR_REJECT",&e.device.id,request);send(&socket,&m,e.peer).await;e.device.state=State::Offline;e.code=None;let _=command.reply.send(Ok(()));continue},
-                                                      Action::Disconnect=>{if active.as_ref()==Some(&e.device.id){account_audio(&engine,e,&mut audio_baseline);}
-                        e.activity_epoch+=1;telemetry.event(&e.device.id,Some(e.session.clone()).filter(|s|!s.is_empty()),EventType::Disconnect);
-                        if !e.session.is_empty(){let m=control(e,"STOP_STREAM",request);send(&socket,&m,e.peer).await;}e.device.state=State::Offline;e.code=None;e.desired=false;e.session.clear();if active.as_ref()==Some(&e.device.id){active=None;engine.reset();}let _=command.reply.send(Ok(()));continue},
-                                                      Action::Audio{source,gain,mute,streaming}=>{
-                                                       if !matches!(e.device.state,State::Connected|State::Streaming){let _=command.reply.send(Err("device is not connected".into()));continue}
-                                                       if streaming==Some(true) && active.as_ref().is_some_and(|id|id!=&e.device.id){let _=command.reply.send(Err("another device is streaming".into()));continue}
-                                                       if let Some(v)=source {let mut m=control(e,"SET_AUDIO_SOURCE",request);m.source=Some(v);m.sign(&e.key);messages.push(m);request=request.wrapping_add(1);}
-                                                       if let Some(v)=gain{let mut m=control(e,"SET_GAIN",request);m.gain=Some(v);m.sign(&e.key);messages.push(m);request=request.wrapping_add(1);}
-                                                       if let Some(v)=mute{let mut m=control(e,"SET_MUTE",request);m.mute=Some(v);m.sign(&e.key);messages.push(m);request=request.wrapping_add(1);}
-                                                       if let Some(v)=streaming{if v {active=Some(e.device.id.clone());}messages.push(control(e,if v{"START_STREAM"}else{"STOP_STREAM"},request));}
-                                                      }
-                                                     }
-                                                     if messages.is_empty(){let _=command.reply.send(Err("empty audio update".into()));continue}
-                                                     send(&socket,&messages[0],e.peer).await;e.pending=Some(Pending{messages,position:0,reply:Some(command.reply),sent:Instant::now(),retries:0});
-                                                    },
-                                                    deadline=tick.tick()=>{let overdue=time::Instant::now().saturating_duration_since(deadline);
-                if engine.playback.diagnostics.drift_telemetry_enabled() {
-                    let mut o=engine.playback.diagnostics.observation("receiver_tick");
-                    o.overdue_us=Some(overdue.as_micros() as u64);
-                    o.scheduled_us=Some(o.rx_monotonic_us.saturating_sub(overdue.as_micros() as u64));
-                    engine.playback.diagnostics.observe(o);
-                }
-                if overdue>Duration::from_millis(20){tick.reset();engine.rebuffer();engine.jitter.metrics.receiver_clock_resets+=1;if let Some(id)=&active && let Some(e)=entries.get(id){telemetry.event_with_context(&e.device.id,Some(e.session.clone()),EventType::BufferResync,None,Some(engine.jitter.metrics.jitter_buffer_depth),Some(engine.jitter.depth));}continue;}
-                if let Some(e) = active.as_ref().and_then(|id| entries.get_mut(id)) && e.device.state == State::Streaming {
-                    let prev_underruns = engine.jitter.metrics.buffer_underruns;
-                    let prev_overruns = engine.jitter.metrics.buffer_overruns;
-                    let prev_lost = engine.jitter.metrics.lost_packets;
-                    engine.tick();
-                    account_audio(&engine, e, &mut audio_baseline);
-                    if engine.jitter.metrics.buffer_underruns > prev_underruns && prev_underruns.is_multiple_of(10) {
-                        telemetry.event_with_context(&e.device.id, Some(e.session.clone()), EventType::BufferUnderrun, None, Some(engine.jitter.metrics.jitter_buffer_depth), Some(engine.jitter.depth));
-                    }
-                    if engine.jitter.metrics.buffer_overruns > prev_overruns {
-                        telemetry.event_with_context(&e.device.id, Some(e.session.clone()), EventType::BufferOverrun, None, Some(engine.jitter.metrics.jitter_buffer_depth), Some(engine.jitter.depth));
-                    }
-                    if engine.jitter.metrics.lost_packets > prev_lost && prev_lost.is_multiple_of(10) {
-                        telemetry.event_with_context(&e.device.id, Some(e.session.clone()), EventType::DeadlineMiss, None, Some(engine.jitter.metrics.jitter_buffer_depth), Some(engine.jitter.depth));
-                    }
-                }
-            },
-                                                    _=maintenance.tick()=>{
-                                                     let now=Instant::now();let heartbeat_due=heartbeat.elapsed()>=Duration::from_secs(1);if heartbeat_due{heartbeat=now;}
-                                                     for e in entries.values_mut(){
-                                                      if e.pending.as_ref().is_some_and(|p|p.sent.elapsed()>Duration::from_millis(500)){
-                                                       if e.pending.as_ref().unwrap().retries>=3{fail(e,"control timeout after 4 attempts");if active.as_ref()==Some(&e.device.id) && e.device.state!=State::Streaming {active=None;engine.reset();}
-                                      if e.device.state==State::Pairing{e.device.state=State::Discovered;e.code=None;}}
-                                                       else if let Some(p)=&mut e.pending{p.retries+=1;p.sent=now;send(&socket,&p.messages[p.position],e.peer).await;}
-                                                      }
-                                                      if e.last.elapsed()>Duration::from_secs(5) && e.device.state!=State::Offline {if active.as_ref()==Some(&e.device.id){account_audio(&engine,e,&mut audio_baseline);}
-                        e.activity_epoch+=1;telemetry.event(&e.device.id,Some(e.session.clone()).filter(|s|!s.is_empty()),EventType::Disconnect);
-                        fail(e,"session timeout");e.device.state=State::Offline;if active.as_ref()==Some(&e.device.id){active=None;engine.reset();}}
-                                                      if heartbeat_due && matches!(e.device.state,State::Connected|State::Streaming){request=request.wrapping_add(1);let h=control(e,"HEARTBEAT",request);send(&socket,&h,e.peer).await;}
-                                                     }
-                                                     telemetry.publish(entries.values().map(|e|DeviceInput{device_id:e.device.id.clone(),session_id:Some(e.session.clone()).filter(|s|!s.is_empty()),connection_state:e.device.state,counters:e.counters,jitter_buffer_depth:if active.as_ref()==Some(&e.device.id){engine.jitter.metrics.jitter_buffer_depth}else{0},activity_epoch:e.activity_epoch,counter_timestamp_ms:Some(counter_clock.elapsed().as_millis() as u64),tx:e.tx.as_ref().filter(|(_,updated,_)|updated.elapsed()<Duration::from_millis(2500)).map(|(t,_,_)|t.clone()),rx_inter_arrival_jitter_ms:if active.as_ref()==Some(&e.device.id) && e.device.state==State::Streaming{Some(engine.metrics().inter_arrival_jitter_ms)}else{None},sequence_gaps:if active.as_ref()==Some(&e.device.id){engine.jitter.metrics.sequence_gaps}else{0},late_packet_drops:if active.as_ref()==Some(&e.device.id){engine.jitter.metrics.late_packet_drops}else{0},target_buffer_depth:if active.as_ref()==Some(&e.device.id){engine.jitter.depth}else{0},underrun_fade_outs:if active.as_ref()==Some(&e.device.id){engine.declicker.fade_outs}else{0},recovery_fade_ins:if active.as_ref()==Some(&e.device.id){engine.declicker.fade_ins}else{0}}).collect());
-                        let mut snap=snapshot.write().await;snap.devices=entries.values().map(|e|e.device.clone()).collect();snap.devices.sort_by(|a,b|a.id.cmp(&b.id));snap.metrics=engine.metrics();snap.active_device=active.clone();
-                                                    }
-                                                    }
+                                                                     let Ok(m)=Message::decode(&cb[..n]) else{continue};let Some(e)=entries.get_mut(&m.device_id)else{continue};
+                                                                     if peer!=e.peer || m.session!=e.session || !m.verify(&e.key){continue};e.last=Instant::now();
+                                                                     if m.kind=="HEARTBEAT" {continue}
+                                                                     let Some(mut pending)=e.pending.take() else{continue};let current=&pending.messages[pending.position];if m.request_id!=current.request_id{e.pending=Some(pending);continue}
+                                                                     if m.kind=="PAIR_REJECT" || m.kind=="ERROR" {let pairing=current.kind=="PAIR_REQUEST";let lab=e.lab.status=="requested";e.pending=Some(pending);fail(e,&m.error);if pairing {e.device.state=State::Discovered;e.code=None;}
+                if lab {engine.playback.diagnostics.emit(mic_audio::diagnostics::EventType::TransportConfigRejected,None,None,engine.jitter.occupancy(),engine.jitter.depth,None,"tx_rejected_configuration");}continue}
+                                                                     if (current.kind=="PAIR_REQUEST" && m.kind!="PAIR_ACCEPT") || (current.kind!="PAIR_REQUEST" && m.kind!="ACK"){e.pending=Some(pending);continue}
+                                                                     if current.transport.is_some() && (m.transport!=current.transport || m.transport_stream!=current.transport_stream) {e.pending=Some(pending);engine.playback.diagnostics.emit(mic_audio::diagnostics::EventType::TransportConfigRejected,None,None,engine.jitter.occupancy(),engine.jitter.depth,None,"configuration_ack_mismatch");fail(e,"configuration ACK mismatch");continue}
+                                                                     match current.kind.as_str(){"PAIR_REQUEST"=>{
+                                        if e.accepted_session.as_ref()!=Some(&e.session) {e.activity_epoch+=1;telemetry.event(&e.device.id,Some(e.session.clone()),EventType::SessionChanged);}
+                                        if e.accepted_session.is_some(){telemetry.event(&e.device.id,Some(e.session.clone()),EventType::Reconnect);}
+                                        e.lab=LabState::default();e.tx=None;e.accepted_session=Some(e.session.clone());e.device.state=State::Connected;e.device.last_error=None;
+                                                             for kind in ["SET_AUDIO_SOURCE","SET_GAIN","SET_MUTE"] {request=request.wrapping_add(1);let mut restore=control(e,kind,request);match kind {"SET_AUDIO_SOURCE"=>restore.source=Some(e.device.source.clone()),"SET_GAIN"=>restore.gain=Some(e.device.gain),_=>restore.mute=Some(e.device.mute)}restore.sign(&e.key);pending.messages.push(restore);}
+                                                             if e.desired && active.as_ref().is_none_or(|id|id==&e.device.id) {active=Some(e.device.id.clone());request=request.wrapping_add(1);pending.messages.push(control(e,"START_STREAM",request));}},"SET_TRANSPORT"=>{e.lab.applied=current.transport;e.lab.error=None;engine.playback.diagnostics.emit(mic_audio::diagnostics::EventType::TransportConfigApplied,None,None,0,current.transport.unwrap().depth(),None,"tx_ack_stopped_configuration");},"START_STREAM"=>{e.lab.stream=current.transport_stream.unwrap_or(0);let cfg=e.lab.applied.unwrap_or(TransportConfig{jitter_buffer_target_ms:(config.jitter.clamp(2,4)*10) as u16,..TransportConfig::default()});engine.configure_transport(cfg,e.lab.applied.is_some());fec.clear();tick=time::interval(Duration::from_millis(cfg.frame_duration_ms as u64));tick.set_missed_tick_behavior(time::MissedTickBehavior::Burst);e.activity_epoch+=1;telemetry.event(&e.device.id,Some(e.session.clone()),EventType::StartStream);audio_baseline=audio_counters(&engine);e.device.state=State::Streaming;e.desired=true;active=Some(e.device.id.clone());engine.set_context(&e.device.id,&e.session);tick.reset();engine.set_mute(e.device.mute);},"STOP_STREAM"=>{account_audio(&engine,e,&mut audio_baseline);e.activity_epoch+=1;telemetry.event(&e.device.id,Some(e.session.clone()),EventType::StopStream);e.device.state=State::Connected;e.desired=false;if active.as_ref()==Some(&e.device.id){active=None;engine.reset();}},"SET_AUDIO_SOURCE"=>e.device.source=current.source.clone().unwrap(),"SET_GAIN"=>e.device.gain=current.gain.unwrap(),"SET_MUTE"=>{e.device.mute=current.mute.unwrap();if active.as_ref()==Some(&e.device.id){engine.set_mute(e.device.mute);}},_=>{}}
+                                                                     e.last_request=m.request_id;pending.position+=1;
+                                                                     if pending.position==pending.messages.len(){if e.lab.status=="requested"{e.lab.status="applied".into();}
+                if let Some(reply)=pending.reply.take(){let _=reply.send(Ok(()));}}
+                                                                     else {pending.sent=Instant::now();pending.retries=0;send(&socket,&pending.messages[pending.position],e.peer).await;e.pending=Some(pending);}
+                                                                    },
+                                                                    Ok((n,peer))=audio.recv_from(&mut ab)=>{
+                         let arrival_us=engine.playback.diagnostics.now_us();
+                         engine.jitter.metrics.received_datagrams+=1;engine.jitter.metrics.received_datagram_bytes+=n as u64;
+                         if let Some(id)=&active && let Some(e)=entries.get_mut(id) {
+                          if peer.ip()!=e.peer.ip(){engine.jitter.metrics.rejected_packets+=1;engine.jitter.metrics.session_rejections+=1;continue}
+                          let decoded = if let Some(cfg)=e.lab.applied {LabPacket::decode(&ab[..n],&e.key,cfg,e.lab.stream).map(Some)} else {AudioPacket::decode(&ab[..n],&e.key).map(|audio|Some(LabPacket{audio,parity:false,stream:0,samples:160}))};
+                          match decoded {
+                           Ok(Some(p)) if hex::encode(p.audio.session)==e.session && e.device.state==State::Streaming=>{
+                             e.last=Instant::now();
+                             let recovered=if e.lab.applied.is_some_and(|c|c.fec.enabled){fec.receive(&p,arrival_us,engine.jitter.expected_sequence(),engine.jitter.started)}else{None};
+                             if !p.parity {engine.receive_at(p.audio.clone(),arrival_us);}
+                             if let Some(r)=recovered {engine.jitter.push(r);}
+                             emit_fec(&engine,&mut fec);account_audio(&engine,e,&mut audio_baseline)},
+                           Ok(_)=>{engine.jitter.metrics.rejected_packets+=1;engine.jitter.metrics.session_rejections+=1;},
+                           Err(error)=>{engine.jitter.metrics.rejected_packets+=1;engine.jitter.metrics.invalid_packets+=1;if error.to_string().contains("authentication"){engine.jitter.metrics.authentication_failures+=1;}else{engine.jitter.metrics.invalid_packet_headers+=1;}}
+                          }
+                         }else {engine.jitter.metrics.unpaired_datagrams+=1;}
+                        },
+                        Some(command)=commands.recv()=>{
+                                                                     let Some(e)=entries.get_mut(&command.id)else{let _=command.reply.send(Err("device not found".into()));continue};if e.pending.is_some(){let _=command.reply.send(Err("device command in progress".into()));continue}
+                                                                     request=request.wrapping_add(1);let mut messages=vec![];
+                                                                     match command.action {
+                                                                      Action::Pair(code)=>{if e.device.state!=State::Discovered || code.len()!=32 || hex::decode(&code).is_err() || commitment(&code,&e.nonce)!=e.commitment{let _=command.reply.send(Err("invalid pairing credential or state".into()));continue}messages.push(pair_message(e,code,request,config.audio,config.control));},
+                                                                      Action::Transport(cfg)=>{
+                                                                       if let Err(err)=cfg.validate(){let _=command.reply.send(Err(err.to_string()));continue}
+                                                                       if !matches!(e.device.state,State::Connected|State::Streaming) || !e.device.capabilities.iter().any(|c|c==CAPABILITY) {let _=command.reply.send(Err("device does not support Audio Lab or is not connected".into()));continue}
+                                                                       if active.as_ref().is_some_and(|id|id!=&e.device.id){let _=command.reply.send(Err("another device is streaming".into()));continue}
+                                                                       let resume=e.device.state==State::Streaming;engine.set_context(&e.device.id,&e.session);e.lab.requested=Some(cfg);e.lab.status="requested".into();e.lab.error=None;
+                                                                       messages.push(control(e,"STOP_STREAM",request));request=request.wrapping_add(1);
+                                                                       let mut m=control(e,"SET_TRANSPORT",request);m.transport=Some(cfg);m.transport_stream=Some(0);m.sign(&e.key);messages.push(m);
+                                                                       if resume {request=request.wrapping_add(1);let mut m=control(e,"START_STREAM",request);m.transport=Some(cfg);m.transport_stream=Some(request);m.sign(&e.key);messages.push(m);}
+                                                                      },
+                                                                      Action::Reject=>{e.rejected_nonce=Some(e.nonce.clone());let m=Message::new("PAIR_REJECT",&e.device.id,request);send(&socket,&m,e.peer).await;e.device.state=State::Offline;e.code=None;let _=command.reply.send(Ok(()));continue},
+                                                                      Action::Disconnect=>{if active.as_ref()==Some(&e.device.id){account_audio(&engine,e,&mut audio_baseline);}
+                                        e.activity_epoch+=1;telemetry.event(&e.device.id,Some(e.session.clone()).filter(|s|!s.is_empty()),EventType::Disconnect);
+                                        if !e.session.is_empty(){let m=control(e,"STOP_STREAM",request);send(&socket,&m,e.peer).await;}e.device.state=State::Offline;e.code=None;e.desired=false;e.session.clear();if active.as_ref()==Some(&e.device.id){active=None;engine.reset();}let _=command.reply.send(Ok(()));continue},
+                                                                      Action::Audio{source,gain,mute,streaming}=>{
+                                                                       if !matches!(e.device.state,State::Connected|State::Streaming){let _=command.reply.send(Err("device is not connected".into()));continue}
+                                                                       if streaming==Some(true) && active.as_ref().is_some_and(|id|id!=&e.device.id){let _=command.reply.send(Err("another device is streaming".into()));continue}
+                                                                       if let Some(v)=source {let mut m=control(e,"SET_AUDIO_SOURCE",request);m.source=Some(v);m.sign(&e.key);messages.push(m);request=request.wrapping_add(1);}
+                                                                       if let Some(v)=gain{let mut m=control(e,"SET_GAIN",request);m.gain=Some(v);m.sign(&e.key);messages.push(m);request=request.wrapping_add(1);}
+                                                                       if let Some(v)=mute{let mut m=control(e,"SET_MUTE",request);m.mute=Some(v);m.sign(&e.key);messages.push(m);request=request.wrapping_add(1);}
+                                                                       if let Some(v)=streaming{if v && e.lab.status=="failed" {let _=command.reply.send(Err("configuration uncertain; reapply transport first".into()));continue}
+        if v {active=Some(e.device.id.clone());}let mut m=control(e,if v{"START_STREAM"}else{"STOP_STREAM"},request);if v && e.lab.applied.is_some() {m.transport=e.lab.applied;m.transport_stream=Some(request);m.sign(&e.key);}
+                if v && e.lab.status=="failed" {let _=command.reply.send(Err("configuration uncertain; reapply transport first".into()));continue}messages.push(m);}
+                                                                      }
+                                                                     }
+                                                                     if messages.is_empty(){let _=command.reply.send(Err("empty audio update".into()));continue}
+                                                                     send(&socket,&messages[0],e.peer).await;e.pending=Some(Pending{messages,position:0,reply:Some(command.reply),sent:Instant::now(),retries:0});
+                                                                    },
+                                                                    deadline=tick.tick()=>{let overdue=time::Instant::now().saturating_duration_since(deadline);
+                                if engine.playback.diagnostics.drift_telemetry_enabled() {
+                                    let mut o=engine.playback.diagnostics.observation("receiver_tick");
+                                    o.overdue_us=Some(overdue.as_micros() as u64);
+                                    o.scheduled_us=Some(o.rx_monotonic_us.saturating_sub(overdue.as_micros() as u64));
+                                    engine.playback.diagnostics.observe(o);
+                                }
+                                if overdue>Duration::from_millis(20){tick.reset();engine.rebuffer();engine.jitter.metrics.receiver_clock_resets+=1;if let Some(id)=&active && let Some(e)=entries.get(id){telemetry.event_with_context(&e.device.id,Some(e.session.clone()),EventType::BufferResync,None,Some(engine.jitter.metrics.jitter_buffer_depth),Some(engine.jitter.depth));}continue;}
+                                fec.expire(engine.playback.diagnostics.now_us());emit_fec(&engine,&mut fec);
+                                if let Some(e) = active.as_ref().and_then(|id| entries.get_mut(id)) && e.device.state == State::Streaming {
+                                    let prev_underruns = engine.jitter.metrics.buffer_underruns;
+                                    let prev_overruns = engine.jitter.metrics.buffer_overruns;
+                                    let prev_lost = engine.jitter.metrics.lost_packets;
+                                    engine.tick();
+                                    fec.advance_deadline(engine.jitter.expected_sequence());
+                                    account_audio(&engine, e, &mut audio_baseline);
+                                    if engine.jitter.metrics.buffer_underruns > prev_underruns && prev_underruns.is_multiple_of(10) {
+                                        telemetry.event_with_context(&e.device.id, Some(e.session.clone()), EventType::BufferUnderrun, None, Some(engine.jitter.metrics.jitter_buffer_depth), Some(engine.jitter.depth));
+                                    }
+                                    if engine.jitter.metrics.buffer_overruns > prev_overruns {
+                                        telemetry.event_with_context(&e.device.id, Some(e.session.clone()), EventType::BufferOverrun, None, Some(engine.jitter.metrics.jitter_buffer_depth), Some(engine.jitter.depth));
+                                    }
+                                    if engine.jitter.metrics.lost_packets > prev_lost && prev_lost.is_multiple_of(10) {
+                                        telemetry.event_with_context(&e.device.id, Some(e.session.clone()), EventType::DeadlineMiss, None, Some(engine.jitter.metrics.jitter_buffer_depth), Some(engine.jitter.depth));
+                                    }
+                                }
+                            },
+                                                                    _=maintenance.tick()=>{
+                                                                     let now=Instant::now();let heartbeat_due=heartbeat.elapsed()>=Duration::from_secs(1);if heartbeat_due{heartbeat=now;}
+                                                                     for e in entries.values_mut(){
+                                                                      if e.pending.as_ref().is_some_and(|p|p.sent.elapsed()>Duration::from_millis(500)){
+                                                                       if e.pending.as_ref().unwrap().retries>=3{let lab=e.lab.status=="requested";if lab {engine.playback.diagnostics.emit(mic_audio::diagnostics::EventType::TransportConfigRejected,None,None,engine.jitter.occupancy(),engine.jitter.depth,None,"configuration_control_timeout_uncertain");}fail(e,"control timeout after 4 attempts");if lab && active.as_ref()==Some(&e.device.id){active=None;engine.reset();e.device.state=State::Connected;}
+                if active.as_ref()==Some(&e.device.id) && e.device.state!=State::Streaming {active=None;engine.reset();}
+                                                      if e.device.state==State::Pairing{e.device.state=State::Discovered;e.code=None;}}
+                                                                       else if let Some(p)=&mut e.pending{p.retries+=1;p.sent=now;send(&socket,&p.messages[p.position],e.peer).await;}
+                                                                      }
+                                                                      if e.last.elapsed()>Duration::from_secs(5) && e.device.state!=State::Offline {if active.as_ref()==Some(&e.device.id){account_audio(&engine,e,&mut audio_baseline);}
+                                        e.activity_epoch+=1;telemetry.event(&e.device.id,Some(e.session.clone()).filter(|s|!s.is_empty()),EventType::Disconnect);
+                                        fail(e,"session timeout");e.device.state=State::Offline;if active.as_ref()==Some(&e.device.id){active=None;engine.reset();}}
+                                                                      if heartbeat_due && matches!(e.device.state,State::Connected|State::Streaming){request=request.wrapping_add(1);let h=control(e,"HEARTBEAT",request);send(&socket,&h,e.peer).await;}
+                                                                     }
+                                                                     telemetry.publish(entries.values().map(|e|DeviceInput{device_id:e.device.id.clone(),session_id:Some(e.session.clone()).filter(|s|!s.is_empty()),connection_state:e.device.state,counters:e.counters,jitter_buffer_depth:if active.as_ref()==Some(&e.device.id){engine.jitter.metrics.jitter_buffer_depth}else{0},activity_epoch:e.activity_epoch,counter_timestamp_ms:Some(counter_clock.elapsed().as_millis() as u64),tx:e.tx.as_ref().filter(|(_,updated,_)|updated.elapsed()<Duration::from_millis(2500)).map(|(t,_,_)|t.clone()),rx_inter_arrival_jitter_ms:if active.as_ref()==Some(&e.device.id) && e.device.state==State::Streaming{Some(engine.metrics().inter_arrival_jitter_ms)}else{None},sequence_gaps:if active.as_ref()==Some(&e.device.id){engine.jitter.metrics.sequence_gaps}else{0},late_packet_drops:if active.as_ref()==Some(&e.device.id){engine.jitter.metrics.late_packet_drops}else{0},target_buffer_depth:if active.as_ref()==Some(&e.device.id){engine.jitter.depth}else{0},underrun_fade_outs:if active.as_ref()==Some(&e.device.id){engine.declicker.fade_outs}else{0},recovery_fade_ins:if active.as_ref()==Some(&e.device.id){engine.declicker.fade_ins}else{0}}).collect());
+                                        let mut snap=snapshot.write().await;snap.devices=entries.values().map(|e|e.device.clone()).collect();snap.devices.sort_by(|a,b|a.id.cmp(&b.id));snap.metrics=engine.metrics();snap.active_device=active.clone();snap.lab=entries.iter().map(|(id,e)|(id.clone(),e.lab.clone())).collect();snap.fec=fec.metrics;snap.counter_monotonic_us=engine.playback.diagnostics.now_us();snap.diagnostic_stream_id=engine.playback.diagnostics.current_stream_id();
+                                                                    }
+                                                                    }
     }
     for e in entries.values_mut() {
         fail(e, "service shutting down");
@@ -334,10 +398,10 @@ pub fn validate_audio(gain: Option<f32>) -> Result<()> {
 fn audio_counters(engine: &Engine) -> Counters {
     let metrics = &engine.jitter.metrics;
     Counters {
-        received_packets: metrics.received_packets,
+        received_packets: engine.authenticated_audio_packets(),
         lost_packets: metrics.lost_packets,
         out_of_order_packets: metrics.sequence_out_of_order,
-        received_bytes: metrics.received_packets.saturating_mul(320),
+        received_bytes: engine.authenticated_pcm_bytes(),
         buffer_underruns: metrics.buffer_underruns.saturating_add(
             engine
                 .playback

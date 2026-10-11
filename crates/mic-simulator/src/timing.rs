@@ -24,21 +24,24 @@ impl Mode {
 pub struct DeadlineClock {
     pub start: Instant,
     pub next_index: u64,
+    pub frame_ms: u64,
 }
 impl DeadlineClock {
     pub fn new(start: Instant) -> Self {
         Self {
             start,
             next_index: 0,
+            frame_ms: 10,
         }
     }
     pub fn deadline(&self) -> Instant {
-        self.start + Duration::from_millis(self.next_index.saturating_mul(10))
+        self.start + Duration::from_millis(self.next_index.saturating_mul(self.frame_ms))
     }
     /// Discard expired slots. Never emit a backlog of stale audio.
     pub fn due(&mut self, now: Instant) -> (u64, u64, Duration) {
         let expected = self.deadline();
-        let current = (now.saturating_duration_since(self.start).as_millis() / 10) as u64;
+        let current =
+            (now.saturating_duration_since(self.start).as_millis() / self.frame_ms as u128) as u64;
         let slot = self.next_index.max(current);
         let skipped = slot - self.next_index;
         let delay = now.saturating_duration_since(expected);
