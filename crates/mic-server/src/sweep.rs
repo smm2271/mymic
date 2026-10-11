@@ -39,11 +39,17 @@ impl Sweep {
             data["current_run"] = Value::Null;
             data["comparison_summary"] = comparison(data["runs"].as_array().unwrap());
         }
-        std::fs::write(
-            root.join("suite.json"),
-            serde_json::to_vec_pretty(&data).unwrap(),
-        )
-        .map_err(|e| e.to_string())?;
+        let bytes = serde_json::to_vec_pretty(&data).unwrap();
+        std::fs::write(root.join("recovery.tmp"), &bytes).map_err(|e| e.to_string())?;
+        std::fs::rename(root.join("recovery.tmp"), root.join("suite.json"))
+            .map_err(|e| e.to_string())?;
+        if let Some(id) = data["suite_id"].as_str() {
+            if id.starts_with("suite-") && id[6..].chars().all(|c| c.is_ascii_digit()) {
+                std::fs::write(root.join("recovery.tmp"), &bytes).map_err(|e| e.to_string())?;
+                std::fs::rename(root.join("recovery.tmp"), root.join(format!("{id}.json")))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         let s = Self {
             data: Arc::new(Mutex::new(data)),
             gate: Arc::new(Mutex::new(())),
@@ -85,8 +91,13 @@ impl Sweep {
         if let Some(id) = d["suite_id"].as_str() {
             if id.starts_with("suite-") && id[6..].chars().all(|c| c.is_ascii_digit()) {
                 std::fs::write(
-                    self.root.join(format!("{id}.json")),
+                    self.root.join(format!("{id}.tmp")),
                     serde_json::to_vec_pretty(&*d).unwrap(),
+                )
+                .map_err(|e| e.to_string())?;
+                std::fs::rename(
+                    self.root.join(format!("{id}.tmp")),
+                    self.root.join(format!("{id}.json")),
                 )
                 .map_err(|e| e.to_string())?;
             }

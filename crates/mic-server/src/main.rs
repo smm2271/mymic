@@ -341,6 +341,7 @@ async fn sweep_history(State(a): State<App>) -> ApiResult {
     Ok(Json(json!(a.sweep.history().map_err(bad)?)))
 }
 async fn sweep_read(State(a): State<App>, Path(id): Path<String>) -> ApiResult {
+    let _reading = a.sweep.data.lock().await;
     Ok(Json(a.sweep.read_archive(&id).map_err(bad)?))
 }
 async fn sweep_status(State(a): State<App>) -> Json<Value> {
